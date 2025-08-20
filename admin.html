@@ -29,6 +29,10 @@
     img.thumb { width:56px; height:56px; object-fit:cover; border-radius:8px; border:1px solid #1f2937; background:#0b1224; }
     .muted { color:#9ca3af; font-size:12px; }
     .hidden { display: none; }
+    .meta { background:#0b1224; border:1px dashed #374151; border-radius:10px; padding:10px; margin-top:8px; }
+    .meta table { width:100%; border-collapse: collapse; }
+    .meta th, .meta td { border-bottom: 1px solid #1f2937; padding:6px; }
+    .pill { display:inline-block; padding: 2px 8px; border-radius: 999px; border:1px solid #374151; font-size:12px; }
   </style>
 </head>
 <body>
@@ -159,11 +163,14 @@
         <td>${it.points}</td>
         <td>${new Date(it.created).toLocaleString()}</td>
         <td>
-          <button class="btn btn-primary" data-action="save">Save</button>
+          <button class="btn" data-action="meta">Meta</button>
+          <button class="btn btn-primary" data-action="save" style="margin-left:6px;">Save</button>
           <button class="btn btn-danger"  data-action="delete" style="margin-left:6px;">Delete</button>
+          <div class="meta hidden" data-panel="meta"></div>
         </td>
       `;
 
+      // Save
       tr.querySelector('[data-action="save"]').addEventListener('click', async () => {
         const alias = tr.querySelector('[data-k="alias"]').value.trim();
         const description = tr.querySelector('[data-k="description"]').value;
@@ -174,13 +181,13 @@
           body: JSON.stringify({ id: it.id, alias, description, category })
         });
         if (r.ok) {
-          // refresh row (points may change)
-          await loadList();
+          await loadList();  // points may have changed
         } else {
           alert('Update failed');
         }
       });
 
+      // Delete
       tr.querySelector('[data-action="delete"]').addEventListener('click', async () => {
         if (!confirm('Delete this submission? This cannot be undone.')) return;
         const r = await fetch('/api/admin/delete', {
@@ -195,7 +202,42 @@
         }
       });
 
+      // Meta (toggle)
+      tr.querySelector('[data-action="meta"]').addEventListener('click', () => {
+        const panel = tr.querySelector('[data-panel="meta"]');
+        if (!panel.classList.contains('hidden')) {
+          panel.classList.add('hidden'); return;
+        }
+        panel.innerHTML = renderMeta(it.metadata || {});
+        panel.classList.remove('hidden');
+      });
+
       return tr;
+    }
+
+    function renderMeta(meta) {
+      if (!meta || typeof meta !== 'object') meta = {};
+      const imei = meta.imei || 'not present';
+      let gpsLine = '';
+      if (meta.gps && typeof meta.gps.lat === 'number' && typeof meta.gps.lon === 'number') {
+        const {lat, lon} = meta.gps;
+        const map = `https://maps.google.com/?q=${lat},${lon}`;
+        gpsLine = `<tr><th>GPS</th><td>${lat}, ${lon} &nbsp; <a href="${map}" target="_blank" rel="noopener">Open map</a></td></tr>`;
+      }
+      // Build key/value table for all metadata
+      const rows = Object.entries(meta)
+        .filter(([k]) => k !== 'gps' && k !== 'imei')  // we show GPS & IMEI separately above
+        .map(([k, v]) => `<tr><th>${esc(k)}</th><td>${esc(typeof v === 'object' ? JSON.stringify(v) : String(v))}</td></tr>`)
+        .join('');
+
+      return `
+        <div class="muted" style="margin-bottom:6px;">EXIF / metadata extracted at upload.</div>
+        <table>
+          <tr><th>IMEI</th><td>${esc(imei)}</td></tr>
+          ${gpsLine || ''}
+          ${rows || '<tr><td colspan="2" class="muted">No other metadata</td></tr>'}
+        </table>
+      `;
     }
 
     function esc(s){return String(s).replace(/[&<>"'`=\/]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','/':'&#x2F;','`':'&#x60;','=':'&#x3D;'}[c]));}
