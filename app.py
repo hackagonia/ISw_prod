@@ -213,7 +213,6 @@ def _save_original_and_thumb(file, sub_id: str) -> tuple[str, str]:
 # Pillow metadata extractor (EXIF + GPS + IPTC + XMP + ICC)
 # -----------------------------------------------------------------------------
 def _exif_num(val):
-    """Convert EXIF rational/tuple to float (or int if whole)."""
     if val is None:
         return None
     try:
@@ -248,7 +247,6 @@ def _dms_to_deg(values, ref):
         return None
 
 def _exif_value_to_py(v):
-    # Convert PIL rationals/tuples to python numbers or strings where sensible
     try:
         if isinstance(v, tuple) and len(v) == 2 and all(isinstance(x, (int, float)) for x in v):
             den = v[1] if v[1] else 1
@@ -300,36 +298,91 @@ def _exif_to_dict(img: Image.Image) -> dict:
                 gps_out["bearing"] = _exif_num(gps_named["GPSImgDirection"])
             out["gps"] = gps_out
 
-        # Keep the full EXIF as readable names
+        # Keep full EXIF as readable names
         out["all"] = {k: _exif_value_to_py(v) for k, v in flat.items()}
     except Exception:
         pass
     return out
 
-def _iptc_to_dict(img: Image.Image) -> dict:
-    # IPTC in JPEG APP13 (Photoshop IRB)
+def _parse_app13_iptc(path: str) -> dict:
+    """
+    Robust IPTC (APP13 Photoshop IRB 8BIM/0x0404) extractor.
+    Returns dict like {'2:90': '...', '1:90': 'UTF8', ...}
+    """
     try:
-        from PIL.JpegImagePlugin import getiptcinfo  # available for JPEGs
-        iptc = getiptcinfo(img)
-        if not iptc:
-            return {}
+        with open(path, 'rb') as f:
+            data = f.read()
+        i = 0
         out = {}
-        for k, v in iptc.items():
-            key = f"{k[0]}:{k[1]}" if isinstance(k, tuple) else str(k)
-            try:
-                if isinstance(v, bytes):
-                    v = v.decode("utf-8", "ignore")
-                elif isinstance(v, (list, tuple)):
-                    v = [x.decode("utf-8", "ignore") if isinstance(x, bytes) else x for x in v]
-            except Exception:
-                pass
-            out[key] = v
+        while True:
+            # find APP13 marker (0xFFED)
+            idx = data.find(b'\xFF\xED', i)
+            if idx == -1:
+                break
+            if idx + 4 > len(data):
+                break
+            # segment length (big endian, includes length bytes)
+            seg_len = int.from_bytes(data[idx+2:idx+4], 'big')
+            start = idx + 4
+            end = start + seg_len - 2  # -2 for the length field itself
+            segment = data[start:end]
+            i = end
+            # Photoshop header
+            if not segment.startswith(b'Photoshop 3.0\x00'):
+                continue
+            p = len(b'Photoshop 3.0\x00')
+            # Iterate image resource blocks
+            while p + 12 <= len(segment):
+                if segment[p:p+4] != b'8BIM':
+                    break
+                p += 4
+                if p + 2 > len(segment): break
+                rid = int.from_bytes(segment[p:p+2], 'big'); p += 2
+                # Pascal string name, padded to even
+                name_len = segment[p]
+                p += 1
+                name = segment[p:p+name_len]; p += name_len
+                if (p % 2) != 0: p += 1
+                if p + 4 > len(segment): break
+                size = int.from_bytes(segment[p:p+4], 'big'); p += 4
+                if p + size > len(segment): break
+                payload = segment[p:p+size]; p += size
+                if (p % 2) != 0: p += 1
+                # IPTC-NAA record is resource id 0x0404
+                if rid == 0x0404 and payload:
+                    # parse IPTC datasets: 0x1C rec dataset len(..)
+                    q = 0
+                    while q + 5 <= len(payload):
+                        if payload[q] != 0x1C:
+                            # skip until next 0x1C
+                            nxt = payload.find(b'\x1C', q+1)
+                            if nxt == -1: break
+                            q = nxt
+                            continue
+                        rec = payload[q+1]; dset = payload[q+2]
+                        ln = int.from_bytes(payload[q+3:q+5], 'big')
+                        q += 5
+                        if q + ln > len(payload): break
+                        val = payload[q:q+ln]; q += ln
+                        key = f"{rec}:{dset}"
+                        try:
+                            # decode bytes best-effort; IPTC suggests Latin-1 unless 1:90 says UTF8
+                            sval = val.decode('utf-8', 'ignore')
+                        except Exception:
+                            sval = val.decode('latin1', 'ignore')
+                        # collect multiple values as list
+                        if key in out:
+                            if isinstance(out[key], list):
+                                out[key].append(sval)
+                            else:
+                                out[key] = [out[key], sval]
+                        else:
+                            out[key] = sval
         return out
     except Exception:
         return {}
 
 def _xmp_to_dict_from_jpeg(path: str) -> dict:
-    # Best-effort XMP extraction by scanning JPEG APP1
     try:
         with open(path, "rb") as f:
             data = f.read()
@@ -387,39 +440,54 @@ def _icc_profile_info(img: Image.Image) -> dict:
 
 def extract_all_metadata_with_pillow(path: str) -> dict:
     """
-    Open the ORIGINAL file and return a rich metadata dict:
-      {
-        basic: {format, size, mode},
-        exif: {all:{...}, gps:{...}},
-        iptc: {...},
-        xmp: {...},
-        icc: {...}
-      }
-    Best-effort; absent sections are omitted.
+    Rich metadata from ORIGINAL file:
+      basic (format/size/mode),
+      exif (all tags + gps),
+      iptc (robust APP13 parser),
+      xmp (APP1 scan),
+      icc (profile info).
     """
     out = {}
+    # basic, exif, icc via PIL
     try:
         with Image.open(path) as img:
             out["basic"] = {"format": img.format, "size": f"{img.width}x{img.height}", "mode": img.mode}
             ex = _exif_to_dict(img)
             if ex:
                 out["exif"] = ex
-            ip = _iptc_to_dict(img)
-            if ip:
-                out["iptc"] = ip
             ic = _icc_profile_info(img)
             if ic:
                 out["icc"] = ic
+            # Best-effort IPTC via Pillow (if available)
+            try:
+                from PIL.JpegImagePlugin import getiptcinfo
+                ip = getiptcinfo(img)
+                if ip:
+                    # normalize Pillow IPTC too (record:dataset)
+                    norm = {}
+                    for k, v in ip.items():
+                        key = f"{k[0]}:{k[1]}" if isinstance(k, tuple) else str(k)
+                        if isinstance(v, bytes):
+                            v = v.decode("utf-8", "ignore")
+                        elif isinstance(v, (list, tuple)):
+                            v = [x.decode("utf-8","ignore") if isinstance(x,bytes) else x for x in v]
+                        norm[key] = v
+                    if norm:
+                        out["iptc"] = norm
+            except Exception:
+                pass
     except Exception:
         pass
 
-    # XMP from JPEG APP1 (done outside of PIL)
-    try:
-        xmp = _xmp_to_dict_from_jpeg(path)
-        if xmp:
-            out["xmp"] = xmp
-    except Exception:
-        pass
+    # Robust IPTC from raw APP13 (fallback & merge)
+    iptc_raw = _parse_app13_iptc(path)
+    if iptc_raw:
+        out.setdefault("iptc", {}).update(iptc_raw)
+
+    # XMP (APP1)
+    xmp = _xmp_to_dict_from_jpeg(path)
+    if xmp:
+        out["xmp"] = xmp
 
     # prune empties
     return {k: v for k, v in out.items() if v not in (None, "", {}, [])}
