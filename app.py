@@ -165,8 +165,133 @@ def _to_rgb_no_alpha(img: Image.Image) -> Image.Image:
 _TAGS = {v: k for k, v in ExifTags.TAGS.items()}
 _GPS_TAGS = ExifTags.GPSTAGS
 
+# def _rational_to_float(x):
+#     try:
+#         return float(x[0]) / float(x[1]) if isinstance(x, tuple) else float(x)
+#     except Exception:
+#         try:
+#             return float(x)
+#         except Exception:
+#             return None
+
+# def _dms_to_deg(values, ref):
+#     try:
+#         d = _rational_to_float(values[0]) or 0.0
+#         m = _rational_to_float(values[1]) or 0.0
+#         s = _rational_to_float(values[2]) or 0.0
+#         deg = d + (m / 60.0) + (s / 3600.0)
+#         if ref in ('S', 'W'):
+#             deg = -deg
+#         return round(deg, 7)
+#     except Exception:
+#         return None
+
+def _parse_exif(img: Image.Image) -> dict:
+    """
+    Return a normalized dict with common EXIF fields + gps (+ imei best-effort).
+    Works on both old/new Pillow; handles GPS IFD properly.
+    """
+    out = {}
+    try:
+        exif = img.getexif()
+        if not exif:
+            return out
+
+        # 1) Basic flattened map
+        flat = {}
+        for tag_id, value in exif.items():
+            name = ExifTags.TAGS.get(tag_id, str(tag_id))
+            flat[name] = value
+
+        # 2) Try to fetch the GPS IFD (preferred on newer Pillow)
+        gps_ifd = None
+        try:
+            # Pillow >= 9 exposes IFD enums; older versions may not
+            IFD = getattr(ExifTags, "IFD", None)
+            if IFD is not None and hasattr(exif, "get_ifd"):
+                gps_ifd = exif.get_ifd(IFD.GPS)
+        except Exception:
+            gps_ifd = None
+
+        # Fallback: some cameras put GPS under "GPSInfo" in the flat map
+        if gps_ifd is None:
+            gps_ifd = flat.get("GPSInfo")
+
+        # Map GPS numeric keys -> names
+        gps = {}
+        if isinstance(gps_ifd, dict):
+            for k, v in gps_ifd.items():
+                name = ExifTags.GPSTAGS.get(k, str(k))
+                gps[name] = v
+
+        # Core fields
+        out["make"] = flat.get("Make")
+        out["model"] = flat.get("Model")
+        out["software"] = flat.get("Software")
+        out["datetime_original"] = flat.get("DateTimeOriginal") or flat.get("DateTime")
+        out["orientation"] = flat.get("Orientation")
+        out["lens_model"] = flat.get("LensModel") or flat.get("LensMake")
+        out["f_number"] = _exif_num(flat.get("FNumber"))
+        out["exposure_time"] = _exif_num(flat.get("ExposureTime"))
+        out["iso_speed"] = flat.get("ISOSpeedRatings") or flat.get("PhotographicSensitivity")
+        out["focal_length"] = _exif_num(flat.get("FocalLength"))
+
+        # GPS → decimal degrees
+        lat = lon = None
+        if "GPSLatitude" in gps and "GPSLatitudeRef" in gps:
+            lat = _dms_to_deg(gps["GPSLatitude"], gps.get("GPSLatitudeRef"))
+        if "GPSLongitude" in gps and "GPSLongitudeRef" in gps:
+            lon = _dms_to_deg(gps["GPSLongitude"], gps.get("GPSLongitudeRef"))
+
+        if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+            out["gps"] = {"lat": round(lat, 7), "lon": round(lon, 7)}
+            # Optional: altitude & bearing if present
+            if "GPSAltitude" in gps:
+                out["gps"]["alt"] = _exif_num(gps["GPSAltitude"])
+            if "GPSImgDirection" in gps:
+                out["gps"]["bearing"] = _exif_num(gps["GPSImgDirection"])
+
+        # Best-effort IMEI hunt (rare)
+        imei = None
+        blob = []
+        for v in flat.values():
+            if isinstance(v, (str, bytes)):
+                try:
+                    blob.append(v.decode("utf-8", "ignore") if isinstance(v, bytes) else v)
+                except Exception:
+                    pass
+        joined = " ".join(blob)
+        m = __import__("re").search(r"\b(\d{14,16})\b", joined)
+        if m:
+            imei = m.group(1)
+        out["imei"] = imei
+
+        # Optional: small raw exif preview (comment if you don’t want it)
+        # out["raw_exif_keys"] = sorted(k for k in flat.keys() if isinstance(k, str))[:50]
+
+    except Exception:
+        # Swallow EXIF parser errors; return what we have.
+        pass
+
+    # Drop empty keys
+    return {k: v for k, v in out.items() if v not in (None, "", {}, [])}
+
+def _exif_num(val):
+    """Convert EXIF rational/tuple to float (or int if whole)."""
+    if val is None:
+        return None
+    try:
+        if isinstance(val, tuple) and len(val) == 2:
+            num = float(val[0]) / float(val[1]) if val[1] else 0.0
+        else:
+            num = float(val)
+        return int(num) if abs(num - int(num)) < 1e-6 else num
+    except Exception:
+        return None
+
 def _rational_to_float(x):
     try:
+        # tuple(num, den) → float; else cast
         return float(x[0]) / float(x[1]) if isinstance(x, tuple) else float(x)
     except Exception:
         try:
@@ -180,66 +305,66 @@ def _dms_to_deg(values, ref):
         m = _rational_to_float(values[1]) or 0.0
         s = _rational_to_float(values[2]) or 0.0
         deg = d + (m / 60.0) + (s / 3600.0)
-        if ref in ('S', 'W'):
+        if ref in ("S", "W"):
             deg = -deg
-        return round(deg, 7)
+        return deg
     except Exception:
         return None
 
-def _parse_exif(img: Image.Image) -> dict:
-    out = {}
-    try:
-        exif = img.getexif()
-        if not exif:
-            return out
-        tmp = {}
-        for tag_id, value in exif.items():
-            name = ExifTags.TAGS.get(tag_id, str(tag_id))
-            tmp[name] = value
+# def _parse_exif(img: Image.Image) -> dict:
+#     out = {}
+#     try:
+#         exif = img.getexif()
+#         if not exif:
+#             return out
+#         tmp = {}
+#         for tag_id, value in exif.items():
+#             name = ExifTags.TAGS.get(tag_id, str(tag_id))
+#             tmp[name] = value
 
-        out['make'] = tmp.get('Make')
-        out['model'] = tmp.get('Model')
-        out['software'] = tmp.get('Software')
-        out['datetime_original'] = tmp.get('DateTimeOriginal') or tmp.get('DateTime')
-        out['orientation'] = tmp.get('Orientation')
-        out['lens_model'] = tmp.get('LensModel') or tmp.get('LensMake')
-        out['f_number'] = tmp.get('FNumber')
-        out['exposure_time'] = tmp.get('ExposureTime')
-        out['iso_speed'] = tmp.get('ISOSpeedRatings') or tmp.get('PhotographicSensitivity')
-        out['focal_length'] = tmp.get('FocalLength')
+#         out['make'] = tmp.get('Make')
+#         out['model'] = tmp.get('Model')
+#         out['software'] = tmp.get('Software')
+#         out['datetime_original'] = tmp.get('DateTimeOriginal') or tmp.get('DateTime')
+#         out['orientation'] = tmp.get('Orientation')
+#         out['lens_model'] = tmp.get('LensModel') or tmp.get('LensMake')
+#         out['f_number'] = tmp.get('FNumber')
+#         out['exposure_time'] = tmp.get('ExposureTime')
+#         out['iso_speed'] = tmp.get('ISOSpeedRatings') or tmp.get('PhotographicSensitivity')
+#         out['focal_length'] = tmp.get('FocalLength')
 
-        gps_raw = tmp.get('GPSInfo')
-        if gps_raw:
-            gps = {}
-            for k, v in gps_raw.items():
-                name = _GPS_TAGS.get(k, str(k))
-                gps[name] = v
-            lat = lon = None
-            if 'GPSLatitude' in gps and 'GPSLatitudeRef' in gps:
-                lat = _dms_to_deg(gps['GPSLatitude'], gps.get('GPSLatitudeRef'))
-            if 'GPSLongitude' in gps and 'GPSLongitudeRef' in gps:
-                lon = _dms_to_deg(gps['GPSLongitude'], gps.get('GPSLongitudeRef'))
-            if lat is not None and lon is not None:
-                out['gps'] = {'lat': lat, 'lon': lon}
+#         gps_raw = tmp.get('GPSInfo')
+#         if gps_raw:
+#             gps = {}
+#             for k, v in gps_raw.items():
+#                 name = _GPS_TAGS.get(k, str(k))
+#                 gps[name] = v
+#             lat = lon = None
+#             if 'GPSLatitude' in gps and 'GPSLatitudeRef' in gps:
+#                 lat = _dms_to_deg(gps['GPSLatitude'], gps.get('GPSLatitudeRef'))
+#             if 'GPSLongitude' in gps and 'GPSLongitudeRef' in gps:
+#                 lon = _dms_to_deg(gps['GPSLongitude'], gps.get('GPSLongitudeRef'))
+#             if lat is not None and lon is not None:
+#                 out['gps'] = {'lat': lat, 'lon': lon}
 
-        # Best-effort IMEI hunt (rare)
-        imei = None
-        str_fields = []
-        for k, v in tmp.items():
-            if isinstance(v, (str, bytes)):
-                try:
-                    s = v.decode('utf-8', 'ignore') if isinstance(v, bytes) else v
-                    str_fields.append(s)
-                except Exception:
-                    pass
-        blob = " ".join(str_fields)
-        m = re.search(r'\b(\d{14,16})\b', blob)
-        if m:
-            imei = m.group(1)
-        out['imei'] = imei
-    except Exception:
-        pass
-    return out
+#         # Best-effort IMEI hunt (rare)
+#         imei = None
+#         str_fields = []
+#         for k, v in tmp.items():
+#             if isinstance(v, (str, bytes)):
+#                 try:
+#                     s = v.decode('utf-8', 'ignore') if isinstance(v, bytes) else v
+#                     str_fields.append(s)
+#                 except Exception:
+#                     pass
+#         blob = " ".join(str_fields)
+#         m = re.search(r'\b(\d{14,16})\b', blob)
+#         if m:
+#             imei = m.group(1)
+#         out['imei'] = imei
+#     except Exception:
+#         pass
+#     return out
 
 def _save_original_and_thumb(file, sub_id: str) -> tuple[str, str]:
     """
