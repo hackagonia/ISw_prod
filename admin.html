@@ -30,8 +30,6 @@
     .muted { color:#9ca3af; font-size:12px; }
     .hidden { display: none; }
     .meta { background:#0b1224; border:1px dashed #374151; border-radius:10px; padding:10px; margin-top:8px; }
-    .meta table { width:100%; border-collapse: collapse; }
-    .meta th, .meta td { border-bottom: 1px solid #1f2937; padding:6px; }
     .pill { display:inline-block; padding: 2px 8px; border-radius: 999px; border:1px solid #374151; font-size:12px; }
   </style>
 </head>
@@ -152,7 +150,7 @@
     function renderRow(it) {
       const tr = document.createElement('tr');
       tr.innerHTML = `
-        <td><a href="${it.image}" target="_blank" rel="noopener"><img class="thumb" src="${it.thumb}" alt=""></a></td>
+        <td><a href="${it.original}" target="_blank" rel="noopener"><img class="thumb" src="${it.thumb}" alt=""></a></td>
         <td><input value="${esc(it.alias)}" data-k="alias"></td>
         <td><textarea data-k="description">${esc(it.description||'')}</textarea></td>
         <td>
@@ -216,28 +214,17 @@
     }
 
     function renderMeta(meta) {
-      if (!meta || typeof meta !== 'object') meta = {};
-      const imei = meta.imei || 'not present';
-      let gpsLine = '';
-      if (meta.gps && typeof meta.gps.lat === 'number' && typeof meta.gps.lon === 'number') {
-        const {lat, lon} = meta.gps;
-        const map = `https://maps.google.com/?q=${lat},${lon}`;
-        gpsLine = `<tr><th>GPS</th><td>${lat}, ${lon} &nbsp; <a href="${map}" target="_blank" rel="noopener">Open map</a></td></tr>`;
+      // With PyExifTool we store: { exiftool_json: {...} }
+      const jsn = (meta && meta.exiftool_json) ? meta.exiftool_json : null;
+      if (jsn && typeof jsn === 'object' && Object.keys(jsn).length > 0) {
+        return `
+          <div class="muted" style="margin-bottom:6px;">Metadata extracted with PyExifTool</div>
+          <pre style="white-space:pre-wrap;max-height:320px;overflow:auto;border:1px solid #374151;border-radius:8px;padding:8px;background:#0b1224;">
+${esc(JSON.stringify(jsn, null, 2))}
+          </pre>
+        `;
       }
-      // Build key/value table for all metadata
-      const rows = Object.entries(meta)
-        .filter(([k]) => k !== 'gps' && k !== 'imei')  // we show GPS & IMEI separately above
-        .map(([k, v]) => `<tr><th>${esc(k)}</th><td>${esc(typeof v === 'object' ? JSON.stringify(v) : String(v))}</td></tr>`)
-        .join('');
-
-      return `
-        <div class="muted" style="margin-bottom:6px;">EXIF / metadata extracted at upload.</div>
-        <table>
-          <tr><th>IMEI</th><td>${esc(imei)}</td></tr>
-          ${gpsLine || ''}
-          ${rows || '<tr><td colspan="2" class="muted">No other metadata</td></tr>'}
-        </table>
-      `;
+      return `<div class="muted">No metadata available.</div>`;
     }
 
     function esc(s){return String(s).replace(/[&<>"'`=\/]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','/':'&#x2F;','`':'&#x60;','=':'&#x3D;'}[c]));}
