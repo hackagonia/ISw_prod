@@ -16,6 +16,13 @@ from flask import (
 from PIL import Image, ImageOps, UnidentifiedImageError, ExifTags
 from werkzeug.security import check_password_hash, generate_password_hash
 
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+except Exception:
+    pass
+    
+
 # -----------------------------------------------------------------------------
 # Flask app & config
 # -----------------------------------------------------------------------------
@@ -160,14 +167,20 @@ def _to_rgb_no_alpha(img: Image.Image) -> Image.Image:
         return img.convert('RGB')
     return img
 
-def _save_image_make_thumb(fs_obj, out_base: Path):
+
+def _save_image_make_thumb(fs_obj, out_base: Path, exif_bytes: bytes | None = None):
+    # open again from stream start; caller should have seek(0) already
     img = Image.open(fs_obj.stream)
     img = ImageOps.exif_transpose(img)
     img = _to_rgb_no_alpha(img)
 
     main_name = f"{out_base.stem}.jpg"
     main_path = UPLOAD_DIR / main_name
-    img.save(main_path, format='JPEG', quality=88, optimize=True)
+    # preserve EXIF if available
+    if exif_bytes:
+        img.save(main_path, format='JPEG', quality=88, optimize=True, exif=exif_bytes)
+    else:
+        img.save(main_path, format='JPEG', quality=88, optimize=True)
 
     thumb_name = f"{out_base.stem}_thumb.jpg"
     thumb_path = UPLOAD_DIR / thumb_name
@@ -176,6 +189,7 @@ def _save_image_make_thumb(fs_obj, out_base: Path):
     thumb.save(thumb_path, format='JPEG', quality=85, optimize=True)
 
     return f"/uploads/{main_name}", f"/uploads/{thumb_name}"
+
 
 # EXIF helpers
 _TAGS = {v: k for k, v in ExifTags.TAGS.items()}
@@ -293,6 +307,7 @@ def submit():
     init_db()
     backfill_points()
 
+    # ---- Validate file ----
     if 'image' not in request.files:
         return jsonify({'error': 'missing file field "image"'}), 400
     file = request.files['image']
@@ -301,23 +316,39 @@ def submit():
     if not _is_image(file):
         return jsonify({'error': 'unsupported file type'}), 400
 
+    # ---- Form fields ----
     uid = (request.form.get('uid') or str(uuid.uuid4())).strip()
     alias = (request.form.get('alias') or 'guest').strip()
     category = (request.form.get('category') or 'general').strip()
     description = (request.form.get('description') or '').strip()
     points = CATEGORY_POINTS.get(category, 0)
 
-    # Save images
-    sub_id = str(uuid.uuid4())
-    image_rel, thumb_rel = _save_image_make_thumb(file, UPLOAD_DIR / sub_id)
-
-    # Extract EXIF/metadata (open from the *saved* main file to ensure consistency)
+    # ---- Extract EXIF from the ORIGINAL upload BEFORE saving ----
+    exif_bytes = None
+    meta = {}
     try:
-        with Image.open((DATA_DIR / image_rel.lstrip('/'))) as img_saved:
-            meta = _parse_exif(img_saved)
+        file.stream.seek(0)
+        _orig_img = Image.open(file.stream)
+        exif_obj = _orig_img.getexif()
+        exif_bytes = exif_obj.tobytes() if exif_obj else None
+        meta = _parse_exif(_orig_img) or {}
     except Exception:
+        exif_bytes = None
         meta = {}
+    finally:
+        # We'll re-open inside the saver; reset stream first
+        try: file.stream.seek(0)
+        except Exception: pass
 
+    # ---- Save images (preserving EXIF when available) ----
+    sub_id = str(uuid.uuid4())
+    image_rel, thumb_rel = _save_image_make_thumb(
+        file,
+        UPLOAD_DIR / sub_id,
+        exif_bytes=exif_bytes  # <- new: keep EXIF on the saved JPEG
+    )
+
+    # ---- Persist ----
     now = datetime.utcnow().isoformat(timespec='seconds') + 'Z'
     day_key = date.today().isoformat()
 
@@ -328,11 +359,15 @@ def submit():
           (id, uid, alias, category, points, description, image, thumb, day_key, created_at, metadata)
         VALUES (?,  ?,   ?,     ?,        ?,      ?,           ?,     ?,     ?,       ?,        ?)
         """,
-        (sub_id, uid, alias, category, points, description,
-         image_rel.lstrip('/'), thumb_rel.lstrip('/'), day_key, now, json.dumps(meta, ensure_ascii=False))
+        (
+            sub_id, uid, alias, category, points, description,
+            image_rel.lstrip('/'), thumb_rel.lstrip('/'),
+            day_key, now, json.dumps(meta, ensure_ascii=False)
+        )
     )
     db.commit()
 
+    # ---- Response ----
     return jsonify({
         'id': sub_id, 'uid': uid, 'alias': alias,
         'category': category, 'points': points,
