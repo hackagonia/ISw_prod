@@ -4,33 +4,17 @@ import os
 import sys
 import io
 import json
-import re
 import argparse
 import sqlite3
 import uuid
+import subprocess
 from datetime import datetime, date
 from pathlib import Path
-from xml.etree import ElementTree as ET
 
 from flask import (
     Flask, request, jsonify, send_from_directory, g, send_file, session
 )
-from PIL import Image, ImageOps, UnidentifiedImageError, ExifTags
-
-# Optional: better HEIC/HEIF support (safe to ignore if wheel unavailable)
-try:
-    import pillow_heif  # type: ignore
-    pillow_heif.register_heif_opener()
-except Exception:
-    pass
-
-# Optional: friendly ICC profile names if available
-try:
-    from PIL import ImageCms
-    _HAS_IMAGECMS = True
-except Exception:
-    _HAS_IMAGECMS = False
-
+from PIL import Image, ImageOps, UnidentifiedImageError  # still used for thumbnail generation
 from werkzeug.security import check_password_hash, generate_password_hash
 
 # -----------------------------------------------------------------------------
@@ -40,7 +24,7 @@ app = Flask(__name__, static_folder='.', static_url_path='')
 app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024  # 25 MB upload cap
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret-change-me')
 app.config.update(
-    SESSION_COOKIE_SECURE=True,   # Render is HTTPS; safe to keep True
+    SESSION_COOKIE_SECURE=True,   # Render is HTTPS
     SESSION_COOKIE_SAMESITE='Lax'
 )
 
@@ -55,6 +39,9 @@ UPLOAD_DIR = DATA_DIR / 'uploads'
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = DATA_DIR / 'app.db'
+
+# Path to local exiftool binary (you placed it next to app.py)
+EXIFTOOL_PATH = str((ROOT / "exiftool").resolve())
 
 # -----------------------------------------------------------------------------
 # Admin credentials (hash-only; no plaintext fallback)
@@ -120,7 +107,7 @@ def init_db():
             thumb TEXT NOT NULL,
             day_key TEXT,
             created_at TEXT,
-            metadata TEXT,
+            metadata TEXT,           -- JSON blob (now: {exiftool_text, exiftool_json})
             original TEXT             -- untouched original file relative path
         )
         """
@@ -146,7 +133,7 @@ def backfill_points():
     db.commit()
 
 # -----------------------------------------------------------------------------
-# Image utilities
+# Image utilities (for thumbnails only)
 # -----------------------------------------------------------------------------
 def _is_image(file_storage) -> bool:
     try:
@@ -210,287 +197,57 @@ def _save_original_and_thumb(file, sub_id: str) -> tuple[str, str]:
     return f"/uploads/{orig_name}", thumb_rel
 
 # -----------------------------------------------------------------------------
-# Pillow metadata extractor (EXIF + GPS + IPTC + XMP + ICC)
+# ExifTool integration
 # -----------------------------------------------------------------------------
-def _exif_num(val):
-    if val is None:
-        return None
+def _extract_metadata_with_exiftool(full_path: str) -> dict:
+    """
+    Runs the local exiftool to produce BOTH:
+      - 'exiftool_text' : raw stdout (full human-readable dump)
+      - 'exiftool_json' : parsed JSON object (all tags)
+    Returns a dict with those keys; {} on failure.
+    """
+    meta: dict = {}
     try:
-        if isinstance(val, tuple) and len(val) == 2:
-            den = val[1] if val[1] else 1
-            num = float(val[0]) / float(den)
+        # raw text (full dump)
+        proc_txt = subprocess.run(
+            [EXIFTOOL_PATH, full_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if proc_txt.returncode == 0 and proc_txt.stdout:
+            meta["exiftool_text"] = proc_txt.stdout
         else:
-            num = float(val)
-        return int(num) if abs(num - int(num)) < 1e-6 else num
-    except Exception:
-        return None
+            meta["exiftool_text"] = proc_txt.stdout or proc_txt.stderr or ""
 
-def _rational_to_float(x):
-    try:
-        return float(x[0]) / float(x[1]) if isinstance(x, tuple) else float(x)
-    except Exception:
-        try:
-            return float(x)
-        except Exception:
-            return None
-
-def _dms_to_deg(values, ref):
-    try:
-        d = _rational_to_float(values[0]) or 0.0
-        m = _rational_to_float(values[1]) or 0.0
-        s = _rational_to_float(values[2]) or 0.0
-        deg = d + (m / 60.0) + (s / 3600.0)
-        if ref in ("S", "W"):
-            deg = -deg
-        return deg
-    except Exception:
-        return None
-
-def _exif_value_to_py(v):
-    try:
-        if isinstance(v, tuple) and len(v) == 2 and all(isinstance(x, (int, float)) for x in v):
-            den = v[1] if v[1] else 1
-            return float(v[0]) / float(den)
-        return v
-    except Exception:
-        return v
-
-def _exif_to_dict(img: Image.Image) -> dict:
-    out = {}
-    try:
-        exif = img.getexif()
-        if not exif:
-            return out
-        # Flatten EXIF name:value
-        flat = {}
-        for tag_id, value in exif.items():
-            name = ExifTags.TAGS.get(tag_id, str(tag_id))
-            flat[name] = value
-
-        # GPS IFD (preferred if supported), else GPSInfo in flat map
-        gps_ifd = None
-        try:
-            IFD = getattr(ExifTags, "IFD", None)
-            if IFD is not None and hasattr(exif, "get_ifd"):
-                gps_ifd = exif.get_ifd(IFD.GPS)
-        except Exception:
-            gps_ifd = None
-        if gps_ifd is None:
-            gps_ifd = flat.get("GPSInfo")
-
-        gps_named = {}
-        if isinstance(gps_ifd, dict):
-            for k, v in gps_ifd.items():
-                gps_named[ExifTags.GPSTAGS.get(k, str(k))] = v
-
-        # Decimal GPS
-        lat = lon = None
-        if "GPSLatitude" in gps_named and "GPSLatitudeRef" in gps_named:
-            lat = _dms_to_deg(gps_named["GPSLatitude"], gps_named.get("GPSLatitudeRef"))
-        if "GPSLongitude" in gps_named and "GPSLongitudeRef" in gps_named:
-            lon = _dms_to_deg(gps_named["GPSLongitude"], gps_named.get("GPSLongitudeRef"))
-
-        if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
-            gps_out = {"lat": round(lat, 7), "lon": round(lon, 7)}
-            if "GPSAltitude" in gps_named:
-                gps_out["alt"] = _exif_num(gps_named["GPSAltitude"])
-            if "GPSImgDirection" in gps_named:
-                gps_out["bearing"] = _exif_num(gps_named["GPSImgDirection"])
-            out["gps"] = gps_out
-
-        # Keep full EXIF as readable names
-        out["all"] = {k: _exif_value_to_py(v) for k, v in flat.items()}
-    except Exception:
-        pass
-    return out
-
-def _parse_app13_iptc(path: str) -> dict:
-    """
-    Robust IPTC (APP13 Photoshop IRB 8BIM/0x0404) extractor.
-    Returns dict like {'2:90': '...', '1:90': 'UTF8', ...}
-    """
-    try:
-        with open(path, 'rb') as f:
-            data = f.read()
-        i = 0
-        out = {}
-        while True:
-            # find APP13 marker (0xFFED)
-            idx = data.find(b'\xFF\xED', i)
-            if idx == -1:
-                break
-            if idx + 4 > len(data):
-                break
-            # segment length (big endian, includes length bytes)
-            seg_len = int.from_bytes(data[idx+2:idx+4], 'big')
-            start = idx + 4
-            end = start + seg_len - 2  # -2 for the length field itself
-            segment = data[start:end]
-            i = end
-            # Photoshop header
-            if not segment.startswith(b'Photoshop 3.0\x00'):
-                continue
-            p = len(b'Photoshop 3.0\x00')
-            # Iterate image resource blocks
-            while p + 12 <= len(segment):
-                if segment[p:p+4] != b'8BIM':
-                    break
-                p += 4
-                if p + 2 > len(segment): break
-                rid = int.from_bytes(segment[p:p+2], 'big'); p += 2
-                # Pascal string name, padded to even
-                name_len = segment[p]
-                p += 1
-                name = segment[p:p+name_len]; p += name_len
-                if (p % 2) != 0: p += 1
-                if p + 4 > len(segment): break
-                size = int.from_bytes(segment[p:p+4], 'big'); p += 4
-                if p + size > len(segment): break
-                payload = segment[p:p+size]; p += size
-                if (p % 2) != 0: p += 1
-                # IPTC-NAA record is resource id 0x0404
-                if rid == 0x0404 and payload:
-                    # parse IPTC datasets: 0x1C rec dataset len(..)
-                    q = 0
-                    while q + 5 <= len(payload):
-                        if payload[q] != 0x1C:
-                            # skip until next 0x1C
-                            nxt = payload.find(b'\x1C', q+1)
-                            if nxt == -1: break
-                            q = nxt
-                            continue
-                        rec = payload[q+1]; dset = payload[q+2]
-                        ln = int.from_bytes(payload[q+3:q+5], 'big')
-                        q += 5
-                        if q + ln > len(payload): break
-                        val = payload[q:q+ln]; q += ln
-                        key = f"{rec}:{dset}"
-                        try:
-                            # decode bytes best-effort; IPTC suggests Latin-1 unless 1:90 says UTF8
-                            sval = val.decode('utf-8', 'ignore')
-                        except Exception:
-                            sval = val.decode('latin1', 'ignore')
-                        # collect multiple values as list
-                        if key in out:
-                            if isinstance(out[key], list):
-                                out[key].append(sval)
-                            else:
-                                out[key] = [out[key], sval]
-                        else:
-                            out[key] = sval
-        return out
-    except Exception:
-        return {}
-
-def _xmp_to_dict_from_jpeg(path: str) -> dict:
-    try:
-        with open(path, "rb") as f:
-            data = f.read()
-        hdr = b"http://ns.adobe.com/xap/1.0/\x00"
-        idx = data.find(hdr)
-        if idx == -1:
-            return {}
-        start = idx + len(hdr)
-        end_tag = b"</x:xmpmeta>"
-        end = data.find(end_tag, start)
-        if end == -1:
-            return {}
-        xmp_bytes = data[start:end + len(end_tag)]
-        root = ET.fromstring(xmp_bytes)
-        return _xml_to_shallow_dict(root)
-    except Exception:
-        return {}
-
-def _xml_to_shallow_dict(root):
-    out = {}
-    try:
-        for elem in root.iter():
-            tag = elem.tag
-            if "}" in tag:
-                tag = tag.split("}", 1)[1]
-            text = (elem.text or "").strip()
-            if text:
-                if tag in out:
-                    if isinstance(out[tag], list):
-                        out[tag].append(text)
-                    else:
-                        out[tag] = [out[tag], text]
-                else:
-                    out[tag] = text
-        return out
-    except Exception:
-        return {}
-
-def _icc_profile_info(img: Image.Image) -> dict:
-    try:
-        icc = img.info.get("icc_profile")
-        if not icc:
-            return {}
-        info = {"bytes": len(icc)}
-        if _HAS_IMAGECMS:
+        # json (machine readable)
+        proc_json = subprocess.run(
+            [EXIFTOOL_PATH, "-json", "-n", full_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if proc_json.returncode == 0 and proc_json.stdout:
             try:
-                pr = ImageCms.ImageCmsProfile(io.BytesIO(icc))
-                info["profile_description"] = ImageCms.getProfileName(pr)
-                info["manufacturer"] = ImageCms.getProfileManufacturer(pr)
+                data = json.loads(proc_json.stdout)
+                meta["exiftool_json"] = data[0] if isinstance(data, list) and data else {}
             except Exception:
-                pass
-        return info
-    except Exception:
-        return {}
+                meta["exiftool_json"] = {}
+        else:
+            meta["exiftool_json"] = {}
 
-def extract_all_metadata_with_pillow(path: str) -> dict:
-    """
-    Rich metadata from ORIGINAL file:
-      basic (format/size/mode),
-      exif (all tags + gps),
-      iptc (robust APP13 parser),
-      xmp (APP1 scan),
-      icc (profile info).
-    """
-    out = {}
-    # basic, exif, icc via PIL
-    try:
-        with Image.open(path) as img:
-            out["basic"] = {"format": img.format, "size": f"{img.width}x{img.height}", "mode": img.mode}
-            ex = _exif_to_dict(img)
-            if ex:
-                out["exif"] = ex
-            ic = _icc_profile_info(img)
-            if ic:
-                out["icc"] = ic
-            # Best-effort IPTC via Pillow (if available)
-            try:
-                from PIL.JpegImagePlugin import getiptcinfo
-                ip = getiptcinfo(img)
-                if ip:
-                    # normalize Pillow IPTC too (record:dataset)
-                    norm = {}
-                    for k, v in ip.items():
-                        key = f"{k[0]}:{k[1]}" if isinstance(k, tuple) else str(k)
-                        if isinstance(v, bytes):
-                            v = v.decode("utf-8", "ignore")
-                        elif isinstance(v, (list, tuple)):
-                            v = [x.decode("utf-8","ignore") if isinstance(x,bytes) else x for x in v]
-                        norm[key] = v
-                    if norm:
-                        out["iptc"] = norm
-            except Exception:
-                pass
-    except Exception:
-        pass
+    except FileNotFoundError:
+        meta["exiftool_text"] = "exiftool not found at {}".format(EXIFTOOL_PATH)
+        meta["exiftool_json"] = {}
+    except Exception as e:
+        meta["exiftool_text"] = f"exiftool error: {e}"
+        meta["exiftool_json"] = {}
 
-    # Robust IPTC from raw APP13 (fallback & merge)
-    iptc_raw = _parse_app13_iptc(path)
-    if iptc_raw:
-        out.setdefault("iptc", {}).update(iptc_raw)
-
-    # XMP (APP1)
-    xmp = _xmp_to_dict_from_jpeg(path)
-    if xmp:
-        out["xmp"] = xmp
-
-    # prune empties
-    return {k: v for k, v in out.items() if v not in (None, "", {}, [])}
+    return meta
 
 # -----------------------------------------------------------------------------
 # Pages
@@ -536,8 +293,8 @@ def submit():
     original_rel, thumb_rel = _save_original_and_thumb(file, sub_id)
     full_path = str((DATA_DIR / original_rel.lstrip('/')).resolve())
 
-    # Extract rich metadata from the ORIGINAL file with Pillow
-    meta = extract_all_metadata_with_pillow(full_path)
+    # Extract metadata using local exiftool (raw text + json)
+    meta = _extract_metadata_with_exiftool(full_path)
 
     # Persist
     now = datetime.utcnow().isoformat(timespec='seconds') + 'Z'
