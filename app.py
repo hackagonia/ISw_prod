@@ -7,15 +7,17 @@ import json
 import argparse
 import sqlite3
 import uuid
-import subprocess
 from datetime import datetime, date
 from pathlib import Path
 
 from flask import (
     Flask, request, jsonify, send_from_directory, g, send_file, session
 )
-from PIL import Image, ImageOps, UnidentifiedImageError  # still used for thumbnail generation
+from PIL import Image, ImageOps, UnidentifiedImageError  # only for thumbnailing
 from werkzeug.security import check_password_hash, generate_password_hash
+
+# PyExifTool (from the 'pyexiftool' package)
+import exiftool
 
 # -----------------------------------------------------------------------------
 # Flask app & config
@@ -24,7 +26,7 @@ app = Flask(__name__, static_folder='.', static_url_path='')
 app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024  # 25 MB upload cap
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret-change-me')
 app.config.update(
-    SESSION_COOKIE_SECURE=True,   # Render is HTTPS
+    SESSION_COOKIE_SECURE=True,   # Render serves HTTPS
     SESSION_COOKIE_SAMESITE='Lax'
 )
 
@@ -40,14 +42,11 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = DATA_DIR / 'app.db'
 
-# Path to local exiftool binary (you placed it next to app.py)
-EXIFTOOL_PATH = str((ROOT / "exiftool").resolve())
-
 # -----------------------------------------------------------------------------
 # Admin credentials (hash-only; no plaintext fallback)
 # -----------------------------------------------------------------------------
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD_HASH = os.getenv("ADMIN_PASSWORD_HASH")  # set this in env
+ADMIN_PASSWORD_HASH = os.getenv("ADMIN_PASSWORD_HASH")  # MUST be set in env for real use
 
 def _admin_password_ok(username: str, password: str) -> bool:
     if username != ADMIN_USERNAME:
@@ -103,11 +102,11 @@ def init_db():
             category TEXT,
             points INTEGER DEFAULT 0,
             description TEXT,
-            image TEXT NOT NULL,     -- kept for backward compat (mirrors 'original')
+            image TEXT NOT NULL,     -- kept for backward compat (now mirrors 'original')
             thumb TEXT NOT NULL,
             day_key TEXT,
             created_at TEXT,
-            metadata TEXT,           -- JSON blob (now: {exiftool_text, exiftool_json})
+            metadata TEXT,           -- JSON blob (exiftool_json)
             original TEXT             -- untouched original file relative path
         )
         """
@@ -133,7 +132,7 @@ def backfill_points():
     db.commit()
 
 # -----------------------------------------------------------------------------
-# Image utilities (for thumbnails only)
+# Image utilities (thumbnailing)
 # -----------------------------------------------------------------------------
 def _is_image(file_storage) -> bool:
     try:
@@ -197,56 +196,20 @@ def _save_original_and_thumb(file, sub_id: str) -> tuple[str, str]:
     return f"/uploads/{orig_name}", thumb_rel
 
 # -----------------------------------------------------------------------------
-# ExifTool integration
+# PyExifTool integration
 # -----------------------------------------------------------------------------
 def _extract_metadata_with_exiftool(full_path: str) -> dict:
     """
-    Runs the local exiftool to produce BOTH:
-      - 'exiftool_text' : raw stdout (full human-readable dump)
-      - 'exiftool_json' : parsed JSON object (all tags)
-    Returns a dict with those keys; {} on failure.
+    Use PyExifTool to extract all metadata. Returns:
+      { "exiftool_json": { ... } }
     """
     meta: dict = {}
     try:
-        # raw text (full dump)
-        proc_txt = subprocess.run(
-            [EXIFTOOL_PATH, full_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-        if proc_txt.returncode == 0 and proc_txt.stdout:
-            meta["exiftool_text"] = proc_txt.stdout
-        else:
-            meta["exiftool_text"] = proc_txt.stdout or proc_txt.stderr or ""
-
-        # json (machine readable)
-        proc_json = subprocess.run(
-            [EXIFTOOL_PATH, "-json", "-n", full_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-        if proc_json.returncode == 0 and proc_json.stdout:
-            try:
-                data = json.loads(proc_json.stdout)
-                meta["exiftool_json"] = data[0] if isinstance(data, list) and data else {}
-            except Exception:
-                meta["exiftool_json"] = {}
-        else:
-            meta["exiftool_json"] = {}
-
-    except FileNotFoundError:
-        meta["exiftool_text"] = "exiftool not found at {}".format(EXIFTOOL_PATH)
-        meta["exiftool_json"] = {}
+        with exiftool.ExifToolHelper() as et:
+            data = et.get_metadata(full_path)
+            meta["exiftool_json"] = data[0] if data else {}
     except Exception as e:
-        meta["exiftool_text"] = f"exiftool error: {e}"
-        meta["exiftool_json"] = {}
-
+        meta["exiftool_json"] = {"error": str(e)}
     return meta
 
 # -----------------------------------------------------------------------------
@@ -293,7 +256,7 @@ def submit():
     original_rel, thumb_rel = _save_original_and_thumb(file, sub_id)
     full_path = str((DATA_DIR / original_rel.lstrip('/')).resolve())
 
-    # Extract metadata using local exiftool (raw text + json)
+    # Extract metadata via PyExifTool (full tag dump)
     meta = _extract_metadata_with_exiftool(full_path)
 
     # Persist
