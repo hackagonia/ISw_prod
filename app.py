@@ -5,23 +5,24 @@ import sys
 import argparse
 import sqlite3
 import uuid
+import json
+import re
 from datetime import datetime, date
 from pathlib import Path
 
 from flask import (
     Flask, request, jsonify, send_from_directory, g, send_file, session
 )
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError, ExifTags
 from werkzeug.security import check_password_hash, generate_password_hash
 
 # -----------------------------------------------------------------------------
 # Flask app & config
 # -----------------------------------------------------------------------------
 app = Flask(__name__, static_folder='.', static_url_path='')
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 25 MB upload cap
-app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', '4rfv5tgb$RFV%TGB')
+app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024  # 25 MB upload cap
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret-change-me')
 
-# If served over HTTPS (Render is HTTPS by default), these help secure cookies.
 app.config.update(
     SESSION_COOKIE_SECURE=True,
     SESSION_COOKIE_SAMESITE='Lax',
@@ -31,8 +32,6 @@ app.config.update(
 # Paths (Render-friendly)
 # -----------------------------------------------------------------------------
 ROOT = Path(__file__).resolve().parent
-
-# Use a persistent disk when on Render (DATA_DIR), else project root.
 DATA_DIR = Path(os.getenv("DATA_DIR", str(ROOT)))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -42,24 +41,20 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / 'app.db'
 
 # -----------------------------------------------------------------------------
-# Admin credentials
+# Admin credentials (hash only; require in env for prod)
 # -----------------------------------------------------------------------------
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-
-# Preferred: use a hash (set ADMIN_PASSWORD_HASH in env)
 ADMIN_PASSWORD_HASH = os.getenv("ADMIN_PASSWORD_HASH")
-
-if not ADMIN_PASSWORD_HASH:
-    raise RuntimeError(
-        "ADMIN_PASSWORD_HASH environment variable must be set. "
-        "Generate one with: python app.py --hash 'YourPassword'"
-    )
+# If you want to hard-require the hash, uncomment below:
+# if not ADMIN_PASSWORD_HASH:
+#     raise RuntimeError("Set ADMIN_PASSWORD_HASH (generate with: python app.py --hash 'YourPass')")
 
 def _admin_password_ok(username: str, password: str) -> bool:
     if username != ADMIN_USERNAME:
         return False
-    return check_password_hash(ADMIN_PASSWORD_HASH, password)
-
+    if ADMIN_PASSWORD_HASH:
+        return check_password_hash(ADMIN_PASSWORD_HASH, password)
+    return False  # no plaintext fallback
 
 def admin_required(fn):
     from functools import wraps
@@ -71,14 +66,14 @@ def admin_required(fn):
     return wrapper
 
 # -----------------------------------------------------------------------------
-# Game categories / points (server authority)
+# Game categories / points
 # -----------------------------------------------------------------------------
 CATEGORY_POINTS = {
-    "sign": 5,              # Military Sign (5)
-    "vehicle": 10,          # Military Vehicle (10)
-    "location": 15,         # Military Location (15)
-    "uniform": 20,          # Uniform (Consent) (20)
-    "uniform_face": 50,     # Uniform + Face (Consent) (50)
+    "sign": 5,
+    "vehicle": 10,
+    "location": 15,
+    "uniform": 20,
+    "uniform_face": 50,
 }
 
 # -----------------------------------------------------------------------------
@@ -91,13 +86,11 @@ def get_db() -> sqlite3.Connection:
         g.db = conn
     return g.db
 
-
 @app.teardown_appcontext
 def close_db(_exc):
     db = g.pop('db', None)
     if db is not None:
         db.close()
-
 
 def init_db():
     db = get_db()
@@ -113,17 +106,20 @@ def init_db():
             image TEXT NOT NULL,
             thumb TEXT NOT NULL,
             day_key TEXT,
-            created_at TEXT
+            created_at TEXT,
+            metadata TEXT
         )
         """
     )
     db.commit()
-    # migrate: ensure description column exists
+    # migrations for older DBs
     cols = {r['name'] for r in db.execute("PRAGMA table_info(submissions)")}
     if 'description' not in cols:
         db.execute("ALTER TABLE submissions ADD COLUMN description TEXT")
         db.commit()
-
+    if 'metadata' not in cols:
+        db.execute("ALTER TABLE submissions ADD COLUMN metadata TEXT")
+        db.commit()
 
 def backfill_points():
     db = get_db()
@@ -135,7 +131,7 @@ def backfill_points():
     db.commit()
 
 # -----------------------------------------------------------------------------
-# Image utilities
+# Image & EXIF utilities
 # -----------------------------------------------------------------------------
 def _is_image(file_storage) -> bool:
     try:
@@ -146,7 +142,6 @@ def _is_image(file_storage) -> bool:
         return False
     except Exception:
         return False
-
 
 def _to_rgb_no_alpha(img: Image.Image) -> Image.Image:
     if img.mode in ('RGBA', 'LA'):
@@ -165,7 +160,6 @@ def _to_rgb_no_alpha(img: Image.Image) -> Image.Image:
         return img.convert('RGB')
     return img
 
-
 def _save_image_make_thumb(fs_obj, out_base: Path):
     img = Image.open(fs_obj.stream)
     img = ImageOps.exif_transpose(img)
@@ -183,19 +177,109 @@ def _save_image_make_thumb(fs_obj, out_base: Path):
 
     return f"/uploads/{main_name}", f"/uploads/{thumb_name}"
 
+# EXIF helpers
+_TAGS = {v: k for k, v in ExifTags.TAGS.items()}
+_GPS_TAGS = ExifTags.GPSTAGS
+
+def _rational_to_float(x):
+    # Pillow can return tuple(Fraction) or PIL.TiffImagePlugin.IFDRational
+    try:
+        return float(x[0]) / float(x[1]) if isinstance(x, tuple) else float(x)
+    except Exception:
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+def _dms_to_deg(values, ref):
+    try:
+        d = _rational_to_float(values[0]) or 0.0
+        m = _rational_to_float(values[1]) or 0.0
+        s = _rational_to_float(values[2]) or 0.0
+        deg = d + (m / 60.0) + (s / 3600.0)
+        if ref in ('S', 'W'):
+            deg = -deg
+        return round(deg, 7)
+    except Exception:
+        return None
+
+def _parse_exif(img: Image.Image) -> dict:
+    """
+    Return a normalized dict with common EXIF fields + gps + best-effort IMEI.
+    """
+    out = {}
+    try:
+        exif = img.getexif()
+        if not exif:
+            return out
+        # map numeric tags to names
+        tmp = {}
+        for tag_id, value in exif.items():
+            name = ExifTags.TAGS.get(tag_id, str(tag_id))
+            tmp[name] = value
+
+        # Common fields
+        out['make'] = tmp.get('Make')
+        out['model'] = tmp.get('Model')
+        out['software'] = tmp.get('Software')
+        out['datetime_original'] = tmp.get('DateTimeOriginal') or tmp.get('DateTime')
+        out['orientation'] = tmp.get('Orientation')
+        out['lens_model'] = tmp.get('LensModel') or tmp.get('LensMake')
+
+        # Exposure-ish
+        out['f_number'] = tmp.get('FNumber')
+        out['exposure_time'] = tmp.get('ExposureTime')
+        out['iso_speed'] = tmp.get('ISOSpeedRatings') or tmp.get('PhotographicSensitivity')
+        out['focal_length'] = tmp.get('FocalLength')
+
+        # GPS
+        gps_raw = tmp.get('GPSInfo')
+        if gps_raw:
+            # gps_raw is dict with numeric keys mapped to GPSTAGS
+            gps = {}
+            for k, v in gps_raw.items():
+                name = _GPS_TAGS.get(k, str(k))
+                gps[name] = v
+            lat = None; lon = None
+            if 'GPSLatitude' in gps and 'GPSLatitudeRef' in gps:
+                lat = _dms_to_deg(gps['GPSLatitude'], gps.get('GPSLatitudeRef'))
+            if 'GPSLongitude' in gps and 'GPSLongitudeRef' in gps:
+                lon = _dms_to_deg(gps['GPSLongitude'], gps.get('GPSLongitudeRef'))
+            if lat is not None and lon is not None:
+                out['gps'] = {'lat': lat, 'lon': lon}
+
+        # Best-effort IMEI hunt (rare). Look through string fields.
+        imei = None
+        str_fields = []
+        for k, v in tmp.items():
+            if isinstance(v, (str, bytes)):
+                try:
+                    s = v.decode('utf-8', 'ignore') if isinstance(v, bytes) else v
+                    str_fields.append(s)
+                except Exception:
+                    pass
+        blob = " ".join(str_fields)
+        # IMEI is typically 14-16 digits; use conservative regex, prefer TAC-based 14/15 digits
+        m = re.search(r'\b(\d{14,16})\b', blob)
+        if m:
+            imei = m.group(1)
+        out['imei'] = imei
+
+    except Exception:
+        # don't fail uploads if EXIF parsing chokes
+        pass
+    return out
+
 # -----------------------------------------------------------------------------
 # Pages
 # -----------------------------------------------------------------------------
 @app.route('/')
 def home():
-    # Default page = leaderboard
     return send_file(ROOT / 'leaderboard.html')
-
 
 @app.route('/upload')
 def upload_page():
     return send_file(ROOT / 'upload.html')
-
 
 @app.route('/admin')
 def admin_page():
@@ -221,11 +305,18 @@ def submit():
     alias = (request.form.get('alias') or 'guest').strip()
     category = (request.form.get('category') or 'general').strip()
     description = (request.form.get('description') or '').strip()
-
     points = CATEGORY_POINTS.get(category, 0)
 
+    # Save images
     sub_id = str(uuid.uuid4())
     image_rel, thumb_rel = _save_image_make_thumb(file, UPLOAD_DIR / sub_id)
+
+    # Extract EXIF/metadata (open from the *saved* main file to ensure consistency)
+    try:
+        with Image.open((DATA_DIR / image_rel.lstrip('/'))) as img_saved:
+            meta = _parse_exif(img_saved)
+    except Exception:
+        meta = {}
 
     now = datetime.utcnow().isoformat(timespec='seconds') + 'Z'
     day_key = date.today().isoformat()
@@ -234,11 +325,11 @@ def submit():
     db.execute(
         """
         INSERT INTO submissions
-          (id, uid, alias, category, points, description, image, thumb, day_key, created_at)
-        VALUES (?,  ?,   ?,     ?,        ?,      ?,           ?,     ?,     ?,       ?)
+          (id, uid, alias, category, points, description, image, thumb, day_key, created_at, metadata)
+        VALUES (?,  ?,   ?,     ?,        ?,      ?,           ?,     ?,     ?,       ?,        ?)
         """,
         (sub_id, uid, alias, category, points, description,
-         image_rel.lstrip('/'), thumb_rel.lstrip('/'), day_key, now)
+         image_rel.lstrip('/'), thumb_rel.lstrip('/'), day_key, now, json.dumps(meta, ensure_ascii=False))
     )
     db.commit()
 
@@ -248,8 +339,8 @@ def submit():
         'description': description,
         'image': image_rel, 'thumb': thumb_rel,
         'day_key': day_key, 'created': now,
+        'metadata': meta,
     }), 201
-
 
 @app.route('/api/leaderboard', methods=['GET'])
 def leaderboard():
@@ -257,7 +348,6 @@ def leaderboard():
     backfill_points()
     db = get_db()
 
-    # Per-user aggregate
     users = db.execute(
         """
         SELECT uid, COALESCE(alias,'guest') AS alias,
@@ -287,11 +377,10 @@ def leaderboard():
         })
     top3 = all_rows[:3]
 
-    # Individual uploads (newest first)
     up = db.execute(
         """
         SELECT id, uid, COALESCE(alias,'guest') AS alias, category, points, description,
-               image, thumb, created_at
+               image, thumb, created_at, metadata
         FROM submissions
         ORDER BY datetime(created_at) DESC
         """
@@ -306,21 +395,18 @@ def leaderboard():
         'image': '/' + r['image'].lstrip('/'),
         'thumb': '/' + r['thumb'].lstrip('/'),
         'created': r['created_at'],
+        'metadata': json.loads(r['metadata']) if r['metadata'] else {},
     } for r in up]
 
     return jsonify({'top3': top3, 'uploads': uploads})
 
-
 @app.route('/uploads/<path:filename>')
 def uploads(filename):
-    # Serve from persistent upload dir
     return send_from_directory(UPLOAD_DIR, filename)
-
 
 @app.route('/manifest.json')
 def manifest():
     return send_file(ROOT / 'manifest.json')
-
 
 @app.route('/sw.js')
 def sw():
@@ -336,7 +422,6 @@ def admin_me():
         'user': ADMIN_USERNAME if session.get('is_admin') else None
     })
 
-
 @app.route('/api/admin/login', methods=['POST'])
 def admin_login():
     data = request.get_json(silent=True) or {}
@@ -347,12 +432,10 @@ def admin_login():
         return jsonify({'ok': True})
     return jsonify({'ok': False, 'error': 'invalid credentials'}), 401
 
-
 @app.route('/api/admin/logout', methods=['POST'])
 def admin_logout():
     session.clear()
     return jsonify({'ok': True})
-
 
 @app.route('/api/admin/list', methods=['GET'])
 @admin_required
@@ -362,7 +445,7 @@ def admin_list():
     rows = db.execute(
         """
         SELECT id, uid, COALESCE(alias,'guest') AS alias, category, points, description,
-               image, thumb, created_at
+               image, thumb, created_at, metadata
         FROM submissions
         ORDER BY datetime(created_at) DESC
         """
@@ -379,17 +462,13 @@ def admin_list():
             'image': '/' + r['image'].lstrip('/'),
             'thumb': '/' + r['thumb'].lstrip('/'),
             'created': r['created_at'],
+            'metadata': json.loads(r['metadata']) if r['metadata'] else {},
         })
     return jsonify(out)
-
 
 @app.route('/api/admin/update', methods=['POST'])
 @admin_required
 def admin_update():
-    """
-    Body (JSON): {id, alias?, description?, category?}
-    Recomputes points if category changes.
-    """
     data = request.get_json(silent=True) or {}
     sub_id = (data.get('id') or '').strip()
     if not sub_id:
@@ -417,14 +496,9 @@ def admin_update():
         return jsonify({'error': 'not found'}), 404
     return jsonify({'ok': True})
 
-
 @app.route('/api/admin/delete', methods=['POST'])
 @admin_required
 def admin_delete():
-    """
-    Body (JSON): {id}
-    Deletes DB row and associated image files.
-    """
     data = request.get_json(silent=True) or {}
     sub_id = (data.get('id') or '').strip()
     if not sub_id:
@@ -437,7 +511,6 @@ def admin_delete():
     if not row:
         return jsonify({'error': 'not found'}), 404
 
-    # Remove files from disk (stored relative like '/uploads/xxxx.jpg')
     def _rm(relpath: str):
         p = DATA_DIR / relpath.lstrip('/')
         try:
@@ -446,15 +519,13 @@ def admin_delete():
         except Exception:
             pass
 
-    _rm(row['image'])
-    _rm(row['thumb'])
-
+    _rm(row['image']); _rm(row['thumb'])
     db.execute("DELETE FROM submissions WHERE id=?", (sub_id,))
     db.commit()
     return jsonify({'ok': True})
 
 # -----------------------------------------------------------------------------
-# CLI helper & dev server (WSGI servers import `app` directly)
+# CLI helper & dev server
 # -----------------------------------------------------------------------------
 def _cli():
     parser = argparse.ArgumentParser(description="SpotOps app")
@@ -469,7 +540,6 @@ def _cli():
     if args.run_dev:
         debug = os.getenv('FLASK_DEBUG', '1') not in ('0', 'false', 'False')
         app.run(host='127.0.0.1', port=5000, debug=debug)
-
 
 if __name__ == '__main__':
     _cli()
