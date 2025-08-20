@@ -18,8 +18,8 @@ from werkzeug.security import check_password_hash, generate_password_hash
 # Flask app & config
 # -----------------------------------------------------------------------------
 app = Flask(__name__, static_folder='.', static_url_path='')
-app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024  # 25 MB upload cap
-app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret-change-me')
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 25 MB upload cap
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', '4rfv5tgb$RFV%TGB')
 
 # If served over HTTPS (Render is HTTPS by default), these help secure cookies.
 app.config.update(
@@ -49,16 +49,16 @@ ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 # Preferred: use a hash (set ADMIN_PASSWORD_HASH in env)
 ADMIN_PASSWORD_HASH = os.getenv("ADMIN_PASSWORD_HASH")
 
-# Dev fallback: plaintext if no hash provided
-ADMIN_PASSWORD_PLAIN = os.getenv("ADMIN_PASSWORD", "admin123") if not ADMIN_PASSWORD_HASH else None
-
+if not ADMIN_PASSWORD_HASH:
+    raise RuntimeError(
+        "ADMIN_PASSWORD_HASH environment variable must be set. "
+        "Generate one with: python app.py --hash 'YourPassword'"
+    )
 
 def _admin_password_ok(username: str, password: str) -> bool:
     if username != ADMIN_USERNAME:
         return False
-    if ADMIN_PASSWORD_HASH:
-        return check_password_hash(ADMIN_PASSWORD_HASH, password)
-    return password == (ADMIN_PASSWORD_PLAIN or '')
+    return check_password_hash(ADMIN_PASSWORD_HASH, password)
 
 
 def admin_required(fn):
