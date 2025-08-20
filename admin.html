@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f172a" />
+  <link rel="manifest" href="manifest.json" />
+  <link rel="apple-touch-icon" href="icons/icon-192.png" />
+  <title>SpotOps — Admin</title>
+  <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: -apple-system, system-ui, Segoe UI, Roboto, Arial, sans-serif; background: #0b1020; color: #e5e7eb; }
+    header { position: sticky; top: 0; z-index: 10; background: #111827; padding: 12px 16px; border-bottom: 1px solid #1f2937; display:flex; gap:12px; align-items:center; }
+    header a { color:#93c5fd; text-decoration:none; }
+    .nav { margin-left:auto; }
+    main { padding: 16px; max-width: 1100px; margin: 0 auto; }
+    .card { border: 1px solid #1f2937; background: #0b1224; border-radius: 12px; padding: 14px; }
+    .row { display: flex; gap: 10px; }
+    .row > * { flex: 1; }
+    .btn { display:inline-flex; align-items:center; justify-content:center; gap:8px; padding:8px 12px; border-radius:8px; border:1px solid #374151; background:#0b1224; color:#e5e7eb; cursor:pointer; }
+    .btn-primary { background:#2563eb; border-color:#1d4ed8; }
+    .btn-danger { background:#b91c1c; border-color:#7f1d1d; }
+    input, select, textarea { width:100%; border-radius:8px; border:1px solid #374151; background:#0b1224; color:#e5e7eb; padding:8px; }
+    textarea { resize: vertical; min-height:60px; }
+    table { width:100%; border-collapse: collapse; }
+    th, td { padding: 8px; border-bottom: 1px solid #1f2937; vertical-align: top; }
+    th { text-align:left; color:#cbd5e1; }
+    img.thumb { width:56px; height:56px; object-fit:cover; border-radius:8px; border:1px solid #1f2937; background:#0b1224; }
+    .muted { color:#9ca3af; font-size:12px; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <header>
+    <div><strong>SpotOps — Admin</strong></div>
+    <div class="nav">
+      <a href="/">Leaderboard</a> · <a href="/upload">Upload</a>
+    </div>
+  </header>
+
+  <main>
+    <!-- Login Card -->
+    <section id="loginCard" class="card">
+      <h2 style="margin:0 0 8px 0; font-size:18px;">Admin Login</h2>
+      <div class="row" style="margin-bottom:10px;">
+        <input id="username" placeholder="Username" autocomplete="username" />
+        <input id="password" placeholder="Password" type="password" autocomplete="current-password" />
+      </div>
+      <button id="loginBtn" class="btn btn-primary">Log in</button>
+      <p id="loginMsg" class="muted" style="margin-top:8px;"></p>
+    </section>
+
+    <!-- Dashboard Card -->
+    <section id="dashCard" class="card hidden" style="margin-top:16px;">
+      <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px;">
+        <h2 style="margin:0; font-size:18px;">Submissions</h2>
+        <span class="muted" id="adminUser"></span>
+        <div style="margin-left:auto;">
+          <button id="logoutBtn" class="btn">Log out</button>
+        </div>
+      </div>
+
+      <div style="overflow:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Image</th>
+              <th>Alias</th>
+              <th>Description</th>
+              <th>Category</th>
+              <th>Points</th>
+              <th>Created</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+      <p id="empty" class="muted hidden">No submissions.</p>
+    </section>
+  </main>
+
+  <script>
+    const loginCard = document.getElementById('loginCard');
+    const dashCard  = document.getElementById('dashCard');
+    const adminUser = document.getElementById('adminUser');
+    const rowsEl = document.getElementById('rows');
+    const emptyEl = document.getElementById('empty');
+    const loginMsg = document.getElementById('loginMsg');
+
+    async function checkMe() {
+      const r = await fetch('/api/admin/me');
+      const data = await r.json();
+      if (data.is_admin) {
+        loginCard.classList.add('hidden');
+        dashCard.classList.remove('hidden');
+        adminUser.textContent = `(logged in as ${data.user})`;
+        await loadList();
+      } else {
+        dashCard.classList.add('hidden');
+        loginCard.classList.remove('hidden');
+      }
+    }
+
+    document.getElementById('loginBtn').addEventListener('click', async () => {
+      const username = document.getElementById('username').value.trim();
+      const password = document.getElementById('password').value;
+      loginMsg.textContent = '';
+      const r = await fetch('/api/admin/login', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({username, password})
+      });
+      if (r.ok) {
+        await checkMe();
+      } else {
+        const e = await r.json().catch(()=>({error:'Login failed'}));
+        loginMsg.textContent = e.error || 'Login failed';
+      }
+    });
+
+    document.getElementById('logoutBtn').addEventListener('click', async () => {
+      await fetch('/api/admin/logout', {method:'POST'});
+      await checkMe();
+    });
+
+    async function loadList() {
+      rowsEl.innerHTML = '';
+      emptyEl.classList.add('hidden');
+      const r = await fetch('/api/admin/list');
+      if (!r.ok) { rowsEl.innerHTML = '<tr><td colspan="7">Failed to load</td></tr>'; return; }
+      const items = await r.json();
+      if (!items.length) { emptyEl.classList.remove('hidden'); return; }
+      for (const it of items) {
+        rowsEl.appendChild(renderRow(it));
+      }
+    }
+
+    const CATEGORY_LABELS = {
+      sign:'Military Sign (5)',
+      vehicle:'Military Vehicle (10)',
+      location:'Military Location (15)',
+      uniform:'Uniform (Consent) (20)',
+      uniform_face:'Uniform + Face (Consent) (50)',
+    };
+
+    function renderRow(it) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td><a href="${it.image}" target="_blank" rel="noopener"><img class="thumb" src="${it.thumb}" alt=""></a></td>
+        <td><input value="${esc(it.alias)}" data-k="alias"></td>
+        <td><textarea data-k="description">${esc(it.description||'')}</textarea></td>
+        <td>
+          <select data-k="category">
+            ${Object.keys(CATEGORY_LABELS).map(k=>`<option value="${k}" ${it.category===k?'selected':''}>${esc(CATEGORY_LABELS[k])}</option>`).join('')}
+          </select>
+        </td>
+        <td>${it.points}</td>
+        <td>${new Date(it.created).toLocaleString()}</td>
+        <td>
+          <button class="btn btn-primary" data-action="save">Save</button>
+          <button class="btn btn-danger"  data-action="delete" style="margin-left:6px;">Delete</button>
+        </td>
+      `;
+
+      tr.querySelector('[data-action="save"]').addEventListener('click', async () => {
+        const alias = tr.querySelector('[data-k="alias"]').value.trim();
+        const description = tr.querySelector('[data-k="description"]').value;
+        const category = tr.querySelector('[data-k="category"]').value;
+        const r = await fetch('/api/admin/update', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ id: it.id, alias, description, category })
+        });
+        if (r.ok) {
+          // refresh row (points may change)
+          await loadList();
+        } else {
+          alert('Update failed');
+        }
+      });
+
+      tr.querySelector('[data-action="delete"]').addEventListener('click', async () => {
+        if (!confirm('Delete this submission? This cannot be undone.')) return;
+        const r = await fetch('/api/admin/delete', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ id: it.id })
+        });
+        if (r.ok) {
+          tr.remove();
+        } else {
+          alert('Delete failed');
+        }
+      });
+
+      return tr;
+    }
+
+    function esc(s){return String(s).replace(/[&<>"'`=\/]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','/':'&#x2F;','`':'&#x60;','=':'&#x3D;'}[c]));}
+
+    // init
+    checkMe();
+
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('./sw.js', {scope:'./'}).catch(()=>{});
+    }
+  </script>
+</body>
+</html>

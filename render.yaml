@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: spotops
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn wsgi:application -b 0.0.0.0:$PORT --workers 2 --threads 2 --timeout 60
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ADMIN_USERNAME
+        value: admin
+      # Prefer hash in production; see note below to generate one
+      - key: ADMIN_PASSWORD_HASH
+        sync: false   
+      - key: DATA_DIR
+        value: /opt/render/data
+    disk:
+      name: spotops-data
+      mountPath: /opt/render/data
+      sizeGB: 1

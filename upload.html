@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f172a" />
+  <link rel="manifest" href="manifest.json" />
+  <link rel="apple-touch-icon" href="icons/icon-192.png" />
+  <title>SpotOps — Upload</title>
+  <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: -apple-system, system-ui, Segoe UI, Roboto, Arial, sans-serif; background: #0b1020; color: #e5e7eb; }
+    header { position: sticky; top: 0; z-index: 10; background: #111827; padding: 12px 16px; border-bottom: 1px solid #1f2937; display:flex; gap:12px; align-items:center; }
+    header a { color:#93c5fd; text-decoration:none; }
+    main { padding: 16px; }
+    .card { border: 1px solid #1f2937; background: #0b1224; border-radius: 12px; padding: 14px; max-width:720px; margin:0 auto; }
+    .row { display: flex; gap: 10px; }
+    .row > * { flex: 1; }
+    .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid #374151; background: #0b1224; color: #e5e7eb; cursor: pointer; font-size: 16px; }
+    .btn-primary { background: #2563eb; border-color: #1d4ed8; }
+    .btn:disabled { opacity: .6; cursor: not-allowed; }
+    .muted { color: #9ca3af; font-size: 12px; }
+    textarea { width:100%; min-height: 80px; border-radius:10px; border:1px solid #374151; background:#0b1224; color:#e5e7eb; padding:10px; resize: vertical; }
+    input[type="text"], select { width:100%; border-radius:10px; border:1px solid #374151; background:#0b1224; color:#e5e7eb; padding:10px; }
+    #photoInput { position:absolute; left:-9999px; width:1px; height:1px; opacity:0; pointer-events:none; }
+    img.preview { width:100%; max-height:320px; object-fit:contain; border-radius:10px; background:#0b1224; border:1px solid #1f2937; }
+    .nav { margin-left:auto; }
+  </style>
+</head>
+<body>
+  <header>
+    <div><strong>SpotOps</strong></div>
+    <div class="nav"><a href="/">Leaderboard</a></div>
+  </header>
+  <main>
+    <section class="card">
+      <h2 style="margin:0 0 8px 0; font-size:18px;">New Submission</h2>
+      <p class="muted" style="margin:0 0 12px 0;">Pick a category, add a description, and upload from camera or device.</p>
+
+      <div class="row" style="margin-bottom:10px;">
+        <input id="alias" type="text" placeholder="Your name (alias)" />
+        <select id="category">
+          <option value="sign">Military Sign (5)</option>
+          <option value="vehicle">Military Vehicle (10)</option>
+          <option value="location">Military Location (15)</option>
+          <option value="uniform">Uniform (Consent) (20)</option>
+          <option value="uniform_face">Uniform + Face (Consent) (50)</option>
+        </select>
+      </div>
+
+      <label class="muted" for="desc">Description</label>
+      <textarea id="desc" placeholder="Brief description of the image (what/where)."></textarea>
+
+      <input id="photoInput" type="file" accept="image/*" capture="environment" />
+
+      <div class="row" style="margin:10px 0;">
+        <button class="btn btn-primary" id="openCamera">📷 Open camera</button>
+        <button class="btn" id="chooseFile">🖼️ Choose from device</button>
+      </div>
+
+      <img id="preview" class="preview" alt="" style="display:none;" />
+      <div class="row" style="margin-top:10px;">
+        <button class="btn" id="clearPreview" style="display:none;">Clear</button>
+        <button class="btn btn-primary" id="uploadBtn" disabled>Submit</button>
+      </div>
+      <p class="muted" id="hint" style="margin-top:8px;"></p>
+    </section>
+  </main>
+
+  <script>
+    const input   = document.getElementById('photoInput');
+    const camera  = document.getElementById('openCamera');
+    const choose  = document.getElementById('chooseFile');
+    const preview = document.getElementById('preview');
+    const clearBt = document.getElementById('clearPreview');
+    const upload  = document.getElementById('uploadBtn');
+    const hint    = document.getElementById('hint');
+    const aliasEl = document.getElementById('alias');
+    const catEl   = document.getElementById('category');
+    const descEl  = document.getElementById('desc');
+
+    let selectedFile = null;
+    function toast(msg){const d=document.createElement('div');d.textContent=msg;d.style.cssText='position:fixed;left:50%;transform:translateX(-50%);bottom:20px;background:#0b1224;border:1px solid #374151;color:#e5e7eb;padding:10px 14px;border-radius:10px;z-index:999';document.body.appendChild(d);setTimeout(()=>d.remove(),3000);}
+
+    // persist alias + uid
+    aliasEl.value = localStorage.getItem('alias') || '';
+    aliasEl.addEventListener('change', () => localStorage.setItem('alias', aliasEl.value.trim()));
+
+    let uid = localStorage.getItem('uid');
+    if (!uid) { uid = (crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString(36)+Math.random().toString(36).slice(2))); localStorage.setItem('uid', uid); }
+
+    async function openPicker(prefCam) {
+      try {
+        if (prefCam) input.setAttribute('capture','environment'); else input.removeAttribute('capture');
+        if (typeof input.showPicker === 'function') await input.showPicker(); else input.click();
+      } catch { try { input.click(); } catch(_){} }
+    }
+    camera.addEventListener('click', () => openPicker(true));
+    choose.addEventListener('click', () => openPicker(false));
+
+    input.addEventListener('change', () => {
+      selectedFile = input.files && input.files[0] ? input.files[0] : null;
+      if (!selectedFile) return;
+      if (!/^image\//i.test(selectedFile.type)) { toast('Please choose an image file.'); selectedFile=null; input.value=''; return; }
+      const url = URL.createObjectURL(selectedFile);
+      preview.src = url; preview.style.display=''; clearBt.style.display=''; upload.disabled=false;
+      hint.textContent = `${selectedFile.name} — ${(selectedFile.size/1024/1024).toFixed(2)} MB`;
+    });
+
+    clearBt.addEventListener('click', () => {
+      selectedFile=null; input.value=''; preview.removeAttribute('src'); preview.style.display='none'; clearBt.style.display='none'; upload.disabled=true; hint.textContent='';
+    });
+
+    upload.addEventListener('click', async () => {
+      if (!selectedFile) return;
+      upload.disabled = true;
+      const alias = (aliasEl.value || 'guest').trim();
+      localStorage.setItem('alias', alias);
+      try {
+        const fd = new FormData();
+        fd.append('image', selectedFile);
+        fd.append('uid', uid);
+        fd.append('alias', alias);
+        fd.append('category', catEl.value);
+        fd.append('description', descEl.value || '');
+
+        const res = await fetch('/api/submit', { method:'POST', body: fd });
+        if (!res.ok) throw new Error('upload failed');
+        await res.json();
+        toast('Uploaded ✔︎');
+        clearBt.click();
+        descEl.value = '';
+      } catch (e) {
+        console.error(e); toast('Upload failed'); upload.disabled = false;
+      }
+    });
+
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('./sw.js', {scope:'./'}).catch(()=>{});
+    }
+  </script>
+</body>
+</html>

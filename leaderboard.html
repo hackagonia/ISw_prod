@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f172a" />
+  <link rel="manifest" href="manifest.json" />
+  <link rel="apple-touch-icon" href="icons/icon-192.png" />
+  <title>SpotOps — Leaderboard</title>
+  <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: -apple-system, system-ui, Segoe UI, Roboto, Arial, sans-serif; background: #0b1020; color: #e5e7eb; }
+    header { position: sticky; top: 0; z-index: 10; background: #111827; padding: 12px 16px; border-bottom: 1px solid #1f2937; display:flex; gap:12px; align-items:center; }
+    header a { color:#93c5fd; text-decoration:none; }
+    main { padding: 16px; }
+    .card { border: 1px solid #1f2937; background: #0b1224; border-radius: 12px; padding: 14px; max-width:1100px; margin: 0 auto 16px auto; }
+    .muted { color: #9ca3af; font-size: 12px; }
+    .top3 { display: grid; grid-template-columns: repeat(3,1fr); gap: 10px; }
+    .podium { text-align:center; border:1px solid #1f2937; background:#0b1224; border-radius:12px; padding:12px; }
+    .podium h3 { margin:4px 0 2px 0; font-size:16px; }
+    .big { font-size:24px; font-weight:700; }
+    table { width:100%; border-collapse: collapse; }
+    th, td { padding: 10px 8px; border-bottom: 1px solid #1f2937; text-align: left; vertical-align: top; }
+    th { font-weight: 600; color: #cbd5e1; }
+    img.thumb { width:56px; height:56px; object-fit:cover; border-radius:8px; border:1px solid #1f2937; background:#0b1224; }
+    .pill { display:inline-block; padding: 2px 8px; border-radius: 999px; border:1px solid #374151; font-size:12px; }
+    .nav { margin-left:auto; }
+  </style>
+</head>
+<body>
+  <header>
+    <div><strong>SpotOps</strong></div>
+    <div class="nav"><a href="/upload">Upload</a></div>
+    <div class="nav"><a href="/admin">Admin Login</a></div>
+  </header>
+  <main>
+    <section class="card">
+      <h2 style="margin:0 0 8px 0; font-size:18px;">Top 3</h2>
+      <div id="top3" class="top3"></div>
+      <p class="muted" id="top3Empty" style="display:none;">No entries yet.</p>
+    </section>
+
+    <section class="card">
+      <h2 style="margin:0 0 8px 0; font-size:18px;">All Uploads</h2>
+      <div class="muted" style="margin-bottom:8px;">Newest first</div>
+      <div style="overflow:auto;">
+        <table id="uploadsTbl">
+          <thead>
+            <tr>
+              <th>Image</th>
+              <th>User</th>
+              <th>Description</th>
+              <th>Category</th>
+              <th>Points</th>
+              <th>Created</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="muted" id="uploadsEmpty" style="display:none;">No uploads yet.</p>
+    </section>
+  </main>
+
+  <script>
+    const top3El = document.getElementById('top3');
+    const top3Empty = document.getElementById('top3Empty');
+    const tbody = document.querySelector('#uploadsTbl tbody');
+    const uploadsEmpty = document.getElementById('uploadsEmpty');
+
+    const CATEGORY_LABELS = {
+      sign:'Military Sign (5)',
+      vehicle:'Military Vehicle (10)',
+      location:'Military Location (15)',
+      uniform:'Uniform (Consent) (20)',
+      uniform_face:'Uniform + Face (Consent) (50)',
+    };
+
+    function escapeHtml(s) {
+      return String(s || '').replace(/[&<>"'`=\/]/g, c => ({
+        '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','/':'&#x2F;','`':'&#x60;','=':'&#x3D;'
+      }[c]));
+    }
+
+    async function load() {
+      top3El.innerHTML = ''; tbody.innerHTML = '';
+      top3Empty.style.display = 'none'; uploadsEmpty.style.display = 'none';
+
+      try {
+        const res = await fetch('/api/leaderboard');
+        if (!res.ok) throw new Error('failed');
+        const data = await res.json();
+
+        // Top 3
+        if (!data.top3 || !data.top3.length) {
+          top3Empty.style.display = '';
+        } else {
+          data.top3.forEach((u, idx) => {
+            const div = document.createElement('div');
+            div.className = 'podium';
+            div.innerHTML = `
+              <div class="pill">#${u.rank || (idx+1)}</div>
+              <h3>${escapeHtml(u.alias || 'guest')}</h3>
+              <div class="big">${u.total_points}</div>
+              <div class="muted">${u.submissions} submission${u.submissions===1?'':'s'}</div>
+            `;
+            top3El.appendChild(div);
+          });
+        }
+
+        // Uploads table
+        if (!data.uploads || !data.uploads.length) {
+          uploadsEmpty.style.display = '';
+        } else {
+          for (const it of data.uploads) {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+              <td><a href="${it.image}" target="_blank" rel="noopener"><img class="thumb" src="${it.thumb}" alt=""></a></td>
+              <td>${escapeHtml(it.alias || 'guest')}</td>
+              <td>${escapeHtml(it.description || '')}</td>
+              <td>${escapeHtml(CATEGORY_LABELS[it.category] || it.category || '')}</td>
+              <td>${it.points}</td>
+              <td>${new Date(it.created).toLocaleString()}</td>
+            `;
+            tbody.appendChild(tr);
+          }
+        }
+      } catch (e) {
+        console.error(e);
+        top3Empty.style.display = '';
+        uploadsEmpty.style.display = '';
+      }
+    }
+
+    load();
+
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('./sw.js', {scope:'./'}).catch(()=>{});
+    }
+  </script>
+</body>
+</html>
