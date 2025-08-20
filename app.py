@@ -2,19 +2,20 @@ from __future__ import annotations
 
 import os
 import sys
+import io
+import json
+import re
 import argparse
 import sqlite3
 import uuid
-import json
-import re
 from datetime import datetime, date
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 from flask import (
     Flask, request, jsonify, send_from_directory, g, send_file, session
 )
 from PIL import Image, ImageOps, UnidentifiedImageError, ExifTags
-from werkzeug.security import check_password_hash, generate_password_hash
 
 # Optional: better HEIC/HEIF support (safe to ignore if wheel unavailable)
 try:
@@ -23,13 +24,25 @@ try:
 except Exception:
     pass
 
+# Optional: friendly ICC profile names if available
+try:
+    from PIL import ImageCms
+    _HAS_IMAGECMS = True
+except Exception:
+    _HAS_IMAGECMS = False
+
+from werkzeug.security import check_password_hash, generate_password_hash
+
 # -----------------------------------------------------------------------------
 # Flask app & config
 # -----------------------------------------------------------------------------
 app = Flask(__name__, static_folder='.', static_url_path='')
 app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024  # 25 MB upload cap
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret-change-me')
-app.config.update(SESSION_COOKIE_SECURE=True, SESSION_COOKIE_SAMESITE='Lax')
+app.config.update(
+    SESSION_COOKIE_SECURE=True,   # Render is HTTPS; safe to keep True
+    SESSION_COOKIE_SAMESITE='Lax'
+)
 
 # -----------------------------------------------------------------------------
 # Paths (Render-friendly)
@@ -44,10 +57,10 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / 'app.db'
 
 # -----------------------------------------------------------------------------
-# Admin credentials (hash only; set ADMIN_PASSWORD_HASH in env)
+# Admin credentials (hash-only; no plaintext fallback)
 # -----------------------------------------------------------------------------
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD_HASH = os.getenv("ADMIN_PASSWORD_HASH")
+ADMIN_PASSWORD_HASH = os.getenv("ADMIN_PASSWORD_HASH")  # set this in env
 
 def _admin_password_ok(username: str, password: str) -> bool:
     if username != ADMIN_USERNAME:
@@ -103,12 +116,12 @@ def init_db():
             category TEXT,
             points INTEGER DEFAULT 0,
             description TEXT,
-            image TEXT NOT NULL,     -- kept for backward compat (now mirrors 'original')
+            image TEXT NOT NULL,     -- kept for backward compat (mirrors 'original')
             thumb TEXT NOT NULL,
             day_key TEXT,
             created_at TEXT,
             metadata TEXT,
-            original TEXT             -- new: untouched original file path
+            original TEXT             -- untouched original file relative path
         )
         """
     )
@@ -133,7 +146,7 @@ def backfill_points():
     db.commit()
 
 # -----------------------------------------------------------------------------
-# Image & EXIF utilities
+# Image utilities
 # -----------------------------------------------------------------------------
 def _is_image(file_storage) -> bool:
     try:
@@ -162,210 +175,6 @@ def _to_rgb_no_alpha(img: Image.Image) -> Image.Image:
         return img.convert('RGB')
     return img
 
-_TAGS = {v: k for k, v in ExifTags.TAGS.items()}
-_GPS_TAGS = ExifTags.GPSTAGS
-
-# def _rational_to_float(x):
-#     try:
-#         return float(x[0]) / float(x[1]) if isinstance(x, tuple) else float(x)
-#     except Exception:
-#         try:
-#             return float(x)
-#         except Exception:
-#             return None
-
-# def _dms_to_deg(values, ref):
-#     try:
-#         d = _rational_to_float(values[0]) or 0.0
-#         m = _rational_to_float(values[1]) or 0.0
-#         s = _rational_to_float(values[2]) or 0.0
-#         deg = d + (m / 60.0) + (s / 3600.0)
-#         if ref in ('S', 'W'):
-#             deg = -deg
-#         return round(deg, 7)
-#     except Exception:
-#         return None
-
-def _parse_exif(img: Image.Image) -> dict:
-    """
-    Return a normalized dict with common EXIF fields + gps (+ imei best-effort).
-    Works on both old/new Pillow; handles GPS IFD properly.
-    """
-    out = {}
-    try:
-        exif = img.getexif()
-        if not exif:
-            return out
-
-        # 1) Basic flattened map
-        flat = {}
-        for tag_id, value in exif.items():
-            name = ExifTags.TAGS.get(tag_id, str(tag_id))
-            flat[name] = value
-
-        # 2) Try to fetch the GPS IFD (preferred on newer Pillow)
-        gps_ifd = None
-        try:
-            # Pillow >= 9 exposes IFD enums; older versions may not
-            IFD = getattr(ExifTags, "IFD", None)
-            if IFD is not None and hasattr(exif, "get_ifd"):
-                gps_ifd = exif.get_ifd(IFD.GPS)
-        except Exception:
-            gps_ifd = None
-
-        # Fallback: some cameras put GPS under "GPSInfo" in the flat map
-        if gps_ifd is None:
-            gps_ifd = flat.get("GPSInfo")
-
-        # Map GPS numeric keys -> names
-        gps = {}
-        if isinstance(gps_ifd, dict):
-            for k, v in gps_ifd.items():
-                name = ExifTags.GPSTAGS.get(k, str(k))
-                gps[name] = v
-
-        # Core fields
-        out["make"] = flat.get("Make")
-        out["model"] = flat.get("Model")
-        out["software"] = flat.get("Software")
-        out["datetime_original"] = flat.get("DateTimeOriginal") or flat.get("DateTime")
-        out["orientation"] = flat.get("Orientation")
-        out["lens_model"] = flat.get("LensModel") or flat.get("LensMake")
-        out["f_number"] = _exif_num(flat.get("FNumber"))
-        out["exposure_time"] = _exif_num(flat.get("ExposureTime"))
-        out["iso_speed"] = flat.get("ISOSpeedRatings") or flat.get("PhotographicSensitivity")
-        out["focal_length"] = _exif_num(flat.get("FocalLength"))
-
-        # GPS → decimal degrees
-        lat = lon = None
-        if "GPSLatitude" in gps and "GPSLatitudeRef" in gps:
-            lat = _dms_to_deg(gps["GPSLatitude"], gps.get("GPSLatitudeRef"))
-        if "GPSLongitude" in gps and "GPSLongitudeRef" in gps:
-            lon = _dms_to_deg(gps["GPSLongitude"], gps.get("GPSLongitudeRef"))
-
-        if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
-            out["gps"] = {"lat": round(lat, 7), "lon": round(lon, 7)}
-            # Optional: altitude & bearing if present
-            if "GPSAltitude" in gps:
-                out["gps"]["alt"] = _exif_num(gps["GPSAltitude"])
-            if "GPSImgDirection" in gps:
-                out["gps"]["bearing"] = _exif_num(gps["GPSImgDirection"])
-
-        # Best-effort IMEI hunt (rare)
-        imei = None
-        blob = []
-        for v in flat.values():
-            if isinstance(v, (str, bytes)):
-                try:
-                    blob.append(v.decode("utf-8", "ignore") if isinstance(v, bytes) else v)
-                except Exception:
-                    pass
-        joined = " ".join(blob)
-        m = __import__("re").search(r"\b(\d{14,16})\b", joined)
-        if m:
-            imei = m.group(1)
-        out["imei"] = imei
-
-        # Optional: small raw exif preview (comment if you don’t want it)
-        # out["raw_exif_keys"] = sorted(k for k in flat.keys() if isinstance(k, str))[:50]
-
-    except Exception:
-        # Swallow EXIF parser errors; return what we have.
-        pass
-
-    # Drop empty keys
-    return {k: v for k, v in out.items() if v not in (None, "", {}, [])}
-
-def _exif_num(val):
-    """Convert EXIF rational/tuple to float (or int if whole)."""
-    if val is None:
-        return None
-    try:
-        if isinstance(val, tuple) and len(val) == 2:
-            num = float(val[0]) / float(val[1]) if val[1] else 0.0
-        else:
-            num = float(val)
-        return int(num) if abs(num - int(num)) < 1e-6 else num
-    except Exception:
-        return None
-
-def _rational_to_float(x):
-    try:
-        # tuple(num, den) → float; else cast
-        return float(x[0]) / float(x[1]) if isinstance(x, tuple) else float(x)
-    except Exception:
-        try:
-            return float(x)
-        except Exception:
-            return None
-
-def _dms_to_deg(values, ref):
-    try:
-        d = _rational_to_float(values[0]) or 0.0
-        m = _rational_to_float(values[1]) or 0.0
-        s = _rational_to_float(values[2]) or 0.0
-        deg = d + (m / 60.0) + (s / 3600.0)
-        if ref in ("S", "W"):
-            deg = -deg
-        return deg
-    except Exception:
-        return None
-
-# def _parse_exif(img: Image.Image) -> dict:
-#     out = {}
-#     try:
-#         exif = img.getexif()
-#         if not exif:
-#             return out
-#         tmp = {}
-#         for tag_id, value in exif.items():
-#             name = ExifTags.TAGS.get(tag_id, str(tag_id))
-#             tmp[name] = value
-
-#         out['make'] = tmp.get('Make')
-#         out['model'] = tmp.get('Model')
-#         out['software'] = tmp.get('Software')
-#         out['datetime_original'] = tmp.get('DateTimeOriginal') or tmp.get('DateTime')
-#         out['orientation'] = tmp.get('Orientation')
-#         out['lens_model'] = tmp.get('LensModel') or tmp.get('LensMake')
-#         out['f_number'] = tmp.get('FNumber')
-#         out['exposure_time'] = tmp.get('ExposureTime')
-#         out['iso_speed'] = tmp.get('ISOSpeedRatings') or tmp.get('PhotographicSensitivity')
-#         out['focal_length'] = tmp.get('FocalLength')
-
-#         gps_raw = tmp.get('GPSInfo')
-#         if gps_raw:
-#             gps = {}
-#             for k, v in gps_raw.items():
-#                 name = _GPS_TAGS.get(k, str(k))
-#                 gps[name] = v
-#             lat = lon = None
-#             if 'GPSLatitude' in gps and 'GPSLatitudeRef' in gps:
-#                 lat = _dms_to_deg(gps['GPSLatitude'], gps.get('GPSLatitudeRef'))
-#             if 'GPSLongitude' in gps and 'GPSLongitudeRef' in gps:
-#                 lon = _dms_to_deg(gps['GPSLongitude'], gps.get('GPSLongitudeRef'))
-#             if lat is not None and lon is not None:
-#                 out['gps'] = {'lat': lat, 'lon': lon}
-
-#         # Best-effort IMEI hunt (rare)
-#         imei = None
-#         str_fields = []
-#         for k, v in tmp.items():
-#             if isinstance(v, (str, bytes)):
-#                 try:
-#                     s = v.decode('utf-8', 'ignore') if isinstance(v, bytes) else v
-#                     str_fields.append(s)
-#                 except Exception:
-#                     pass
-#         blob = " ".join(str_fields)
-#         m = re.search(r'\b(\d{14,16})\b', blob)
-#         if m:
-#             imei = m.group(1)
-#         out['imei'] = imei
-#     except Exception:
-#         pass
-#     return out
-
 def _save_original_and_thumb(file, sub_id: str) -> tuple[str, str]:
     """
     Save the original bytes untouched (keeps all metadata, format, etc.)
@@ -385,6 +194,7 @@ def _save_original_and_thumb(file, sub_id: str) -> tuple[str, str]:
 
     # Make a JPEG thumbnail
     file.stream.seek(0)
+    thumb_rel = f"/uploads/{orig_name}"  # fallback to original if we fail to render
     try:
         img = Image.open(file.stream)
         img = ImageOps.exif_transpose(img)
@@ -395,10 +205,224 @@ def _save_original_and_thumb(file, sub_id: str) -> tuple[str, str]:
         img.save(thumb_path, format='JPEG', quality=85, optimize=True)
         thumb_rel = f"/uploads/{thumb_name}"
     except Exception:
-        # If we can't decode, use a 1x1 placeholder?
-        thumb_rel = f"/uploads/{orig_name}"  # last resort: link to original
+        pass
 
     return f"/uploads/{orig_name}", thumb_rel
+
+# -----------------------------------------------------------------------------
+# Pillow metadata extractor (EXIF + GPS + IPTC + XMP + ICC)
+# -----------------------------------------------------------------------------
+def _exif_num(val):
+    """Convert EXIF rational/tuple to float (or int if whole)."""
+    if val is None:
+        return None
+    try:
+        if isinstance(val, tuple) and len(val) == 2:
+            den = val[1] if val[1] else 1
+            num = float(val[0]) / float(den)
+        else:
+            num = float(val)
+        return int(num) if abs(num - int(num)) < 1e-6 else num
+    except Exception:
+        return None
+
+def _rational_to_float(x):
+    try:
+        return float(x[0]) / float(x[1]) if isinstance(x, tuple) else float(x)
+    except Exception:
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+def _dms_to_deg(values, ref):
+    try:
+        d = _rational_to_float(values[0]) or 0.0
+        m = _rational_to_float(values[1]) or 0.0
+        s = _rational_to_float(values[2]) or 0.0
+        deg = d + (m / 60.0) + (s / 3600.0)
+        if ref in ("S", "W"):
+            deg = -deg
+        return deg
+    except Exception:
+        return None
+
+def _exif_value_to_py(v):
+    # Convert PIL rationals/tuples to python numbers or strings where sensible
+    try:
+        if isinstance(v, tuple) and len(v) == 2 and all(isinstance(x, (int, float)) for x in v):
+            den = v[1] if v[1] else 1
+            return float(v[0]) / float(den)
+        return v
+    except Exception:
+        return v
+
+def _exif_to_dict(img: Image.Image) -> dict:
+    out = {}
+    try:
+        exif = img.getexif()
+        if not exif:
+            return out
+        # Flatten EXIF name:value
+        flat = {}
+        for tag_id, value in exif.items():
+            name = ExifTags.TAGS.get(tag_id, str(tag_id))
+            flat[name] = value
+
+        # GPS IFD (preferred if supported), else GPSInfo in flat map
+        gps_ifd = None
+        try:
+            IFD = getattr(ExifTags, "IFD", None)
+            if IFD is not None and hasattr(exif, "get_ifd"):
+                gps_ifd = exif.get_ifd(IFD.GPS)
+        except Exception:
+            gps_ifd = None
+        if gps_ifd is None:
+            gps_ifd = flat.get("GPSInfo")
+
+        gps_named = {}
+        if isinstance(gps_ifd, dict):
+            for k, v in gps_ifd.items():
+                gps_named[ExifTags.GPSTAGS.get(k, str(k))] = v
+
+        # Decimal GPS
+        lat = lon = None
+        if "GPSLatitude" in gps_named and "GPSLatitudeRef" in gps_named:
+            lat = _dms_to_deg(gps_named["GPSLatitude"], gps_named.get("GPSLatitudeRef"))
+        if "GPSLongitude" in gps_named and "GPSLongitudeRef" in gps_named:
+            lon = _dms_to_deg(gps_named["GPSLongitude"], gps_named.get("GPSLongitudeRef"))
+
+        if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+            gps_out = {"lat": round(lat, 7), "lon": round(lon, 7)}
+            if "GPSAltitude" in gps_named:
+                gps_out["alt"] = _exif_num(gps_named["GPSAltitude"])
+            if "GPSImgDirection" in gps_named:
+                gps_out["bearing"] = _exif_num(gps_named["GPSImgDirection"])
+            out["gps"] = gps_out
+
+        # Keep the full EXIF as readable names
+        out["all"] = {k: _exif_value_to_py(v) for k, v in flat.items()}
+    except Exception:
+        pass
+    return out
+
+def _iptc_to_dict(img: Image.Image) -> dict:
+    # IPTC in JPEG APP13 (Photoshop IRB)
+    try:
+        from PIL.JpegImagePlugin import getiptcinfo  # available for JPEGs
+        iptc = getiptcinfo(img)
+        if not iptc:
+            return {}
+        out = {}
+        for k, v in iptc.items():
+            key = f"{k[0]}:{k[1]}" if isinstance(k, tuple) else str(k)
+            try:
+                if isinstance(v, bytes):
+                    v = v.decode("utf-8", "ignore")
+                elif isinstance(v, (list, tuple)):
+                    v = [x.decode("utf-8", "ignore") if isinstance(x, bytes) else x for x in v]
+            except Exception:
+                pass
+            out[key] = v
+        return out
+    except Exception:
+        return {}
+
+def _xmp_to_dict_from_jpeg(path: str) -> dict:
+    # Best-effort XMP extraction by scanning JPEG APP1
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        hdr = b"http://ns.adobe.com/xap/1.0/\x00"
+        idx = data.find(hdr)
+        if idx == -1:
+            return {}
+        start = idx + len(hdr)
+        end_tag = b"</x:xmpmeta>"
+        end = data.find(end_tag, start)
+        if end == -1:
+            return {}
+        xmp_bytes = data[start:end + len(end_tag)]
+        root = ET.fromstring(xmp_bytes)
+        return _xml_to_shallow_dict(root)
+    except Exception:
+        return {}
+
+def _xml_to_shallow_dict(root):
+    out = {}
+    try:
+        for elem in root.iter():
+            tag = elem.tag
+            if "}" in tag:
+                tag = tag.split("}", 1)[1]
+            text = (elem.text or "").strip()
+            if text:
+                if tag in out:
+                    if isinstance(out[tag], list):
+                        out[tag].append(text)
+                    else:
+                        out[tag] = [out[tag], text]
+                else:
+                    out[tag] = text
+        return out
+    except Exception:
+        return {}
+
+def _icc_profile_info(img: Image.Image) -> dict:
+    try:
+        icc = img.info.get("icc_profile")
+        if not icc:
+            return {}
+        info = {"bytes": len(icc)}
+        if _HAS_IMAGECMS:
+            try:
+                pr = ImageCms.ImageCmsProfile(io.BytesIO(icc))
+                info["profile_description"] = ImageCms.getProfileName(pr)
+                info["manufacturer"] = ImageCms.getProfileManufacturer(pr)
+            except Exception:
+                pass
+        return info
+    except Exception:
+        return {}
+
+def extract_all_metadata_with_pillow(path: str) -> dict:
+    """
+    Open the ORIGINAL file and return a rich metadata dict:
+      {
+        basic: {format, size, mode},
+        exif: {all:{...}, gps:{...}},
+        iptc: {...},
+        xmp: {...},
+        icc: {...}
+      }
+    Best-effort; absent sections are omitted.
+    """
+    out = {}
+    try:
+        with Image.open(path) as img:
+            out["basic"] = {"format": img.format, "size": f"{img.width}x{img.height}", "mode": img.mode}
+            ex = _exif_to_dict(img)
+            if ex:
+                out["exif"] = ex
+            ip = _iptc_to_dict(img)
+            if ip:
+                out["iptc"] = ip
+            ic = _icc_profile_info(img)
+            if ic:
+                out["icc"] = ic
+    except Exception:
+        pass
+
+    # XMP from JPEG APP1 (done outside of PIL)
+    try:
+        xmp = _xmp_to_dict_from_jpeg(path)
+        if xmp:
+            out["xmp"] = xmp
+    except Exception:
+        pass
+
+    # prune empties
+    return {k: v for k, v in out.items() if v not in (None, "", {}, [])}
 
 # -----------------------------------------------------------------------------
 # Pages
@@ -439,22 +463,15 @@ def submit():
     description = (request.form.get('description') or '').strip()
     points = CATEGORY_POINTS.get(category, 0)
 
-    # Extract metadata from the original upload (before saving)
-    meta = {}
-    try:
-        file.stream.seek(0)
-        _orig_img = Image.open(file.stream)
-        meta = _parse_exif(_orig_img) or {}
-    except Exception:
-        meta = {}
-    finally:
-        try: file.stream.seek(0)
-        except Exception: pass
-
     # Save original + thumbnail
     sub_id = str(uuid.uuid4())
     original_rel, thumb_rel = _save_original_and_thumb(file, sub_id)
+    full_path = str((DATA_DIR / original_rel.lstrip('/')).resolve())
 
+    # Extract rich metadata from the ORIGINAL file with Pillow
+    meta = extract_all_metadata_with_pillow(full_path)
+
+    # Persist
     now = datetime.utcnow().isoformat(timespec='seconds') + 'Z'
     day_key = date.today().isoformat()
 
@@ -462,12 +479,14 @@ def submit():
     db.execute(
         """
         INSERT INTO submissions
-          (id, uid, alias, category, points, description, image, thumb, day_key, created_at, metadata, original)
-        VALUES (?,  ?,   ?,     ?,        ?,      ?,           ?,     ?,     ?,       ?,        ?,        ?)
+          (id, uid, alias, category, points, description,
+           image, thumb, day_key, created_at, metadata, original)
+        VALUES (?,  ?,   ?,     ?,        ?,      ?, 
+                ?,     ?,     ?,       ?,        ?,        ?)
         """,
         (
             sub_id, uid, alias, category, points, description,
-            original_rel.lstrip('/'),  # 'image' kept for compatibility; store original path
+            original_rel.lstrip('/'),   # 'image' kept for compat (same as original)
             thumb_rel.lstrip('/'),
             day_key, now, json.dumps(meta, ensure_ascii=False),
             original_rel.lstrip('/'),
@@ -479,8 +498,8 @@ def submit():
         'id': sub_id, 'uid': uid, 'alias': alias,
         'category': category, 'points': points,
         'description': description,
-        'image': original_rel,        # compatibility (same as original)
-        'original': original_rel,     # explicit original
+        'image': original_rel,          # compat
+        'original': original_rel,       # explicit
         'thumb': thumb_rel,
         'day_key': day_key, 'created': now,
         'metadata': meta,
@@ -536,7 +555,7 @@ def leaderboard():
         'category': r['category'],
         'points': r['points'],
         'description': r['description'] or '',
-        'image': '/' + r['image'].lstrip('/'),       # compat
+        'image': '/' + r['image'].lstrip('/'),                    # compat
         'original': '/' + (r['original'] or r['image']).lstrip('/'),
         'thumb': '/' + r['thumb'].lstrip('/'),
         'created': r['created_at'],
@@ -562,8 +581,10 @@ def sw():
 # -----------------------------------------------------------------------------
 @app.route('/api/admin/me', methods=['GET'])
 def admin_me():
-    return jsonify({'is_admin': bool(session.get('is_admin')),
-                    'user': ADMIN_USERNAME if session.get('is_admin') else None})
+    return jsonify({
+        'is_admin': bool(session.get('is_admin')),
+        'user': ADMIN_USERNAME if session.get('is_admin') else None
+    })
 
 @app.route('/api/admin/login', methods=['POST'])
 def admin_login():
@@ -602,7 +623,7 @@ def admin_list():
             'category': r['category'],
             'points': r['points'],
             'description': r['description'] or '',
-            'image': '/' + r['image'].lstrip('/'),           # compat
+            'image': '/' + r['image'].lstrip('/'),                    # compat
             'original': '/' + (r['original'] or r['image']).lstrip('/'),
             'thumb': '/' + r['thumb'].lstrip('/'),
             'created': r['created_at'],
