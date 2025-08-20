@@ -16,12 +16,12 @@ from flask import (
 from PIL import Image, ImageOps, UnidentifiedImageError, ExifTags
 from werkzeug.security import check_password_hash, generate_password_hash
 
+# Optional: better HEIC/HEIF support (safe to ignore if wheel unavailable)
 try:
-    import pillow_heif
+    import pillow_heif  # type: ignore
     pillow_heif.register_heif_opener()
 except Exception:
     pass
-    
 
 # -----------------------------------------------------------------------------
 # Flask app & config
@@ -29,11 +29,7 @@ except Exception:
 app = Flask(__name__, static_folder='.', static_url_path='')
 app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024  # 25 MB upload cap
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret-change-me')
-
-app.config.update(
-    SESSION_COOKIE_SECURE=True,
-    SESSION_COOKIE_SAMESITE='Lax',
-)
+app.config.update(SESSION_COOKIE_SECURE=True, SESSION_COOKIE_SAMESITE='Lax')
 
 # -----------------------------------------------------------------------------
 # Paths (Render-friendly)
@@ -48,20 +44,17 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / 'app.db'
 
 # -----------------------------------------------------------------------------
-# Admin credentials (hash only; require in env for prod)
+# Admin credentials (hash only; set ADMIN_PASSWORD_HASH in env)
 # -----------------------------------------------------------------------------
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD_HASH = os.getenv("ADMIN_PASSWORD_HASH")
-# If you want to hard-require the hash, uncomment below:
-# if not ADMIN_PASSWORD_HASH:
-#     raise RuntimeError("Set ADMIN_PASSWORD_HASH (generate with: python app.py --hash 'YourPass')")
 
 def _admin_password_ok(username: str, password: str) -> bool:
     if username != ADMIN_USERNAME:
         return False
-    if ADMIN_PASSWORD_HASH:
-        return check_password_hash(ADMIN_PASSWORD_HASH, password)
-    return False  # no plaintext fallback
+    if not ADMIN_PASSWORD_HASH:
+        return False
+    return check_password_hash(ADMIN_PASSWORD_HASH, password)
 
 def admin_required(fn):
     from functools import wraps
@@ -110,11 +103,12 @@ def init_db():
             category TEXT,
             points INTEGER DEFAULT 0,
             description TEXT,
-            image TEXT NOT NULL,
+            image TEXT NOT NULL,     -- kept for backward compat (now mirrors 'original')
             thumb TEXT NOT NULL,
             day_key TEXT,
             created_at TEXT,
-            metadata TEXT
+            metadata TEXT,
+            original TEXT             -- new: untouched original file path
         )
         """
     )
@@ -123,10 +117,11 @@ def init_db():
     cols = {r['name'] for r in db.execute("PRAGMA table_info(submissions)")}
     if 'description' not in cols:
         db.execute("ALTER TABLE submissions ADD COLUMN description TEXT")
-        db.commit()
     if 'metadata' not in cols:
         db.execute("ALTER TABLE submissions ADD COLUMN metadata TEXT")
-        db.commit()
+    if 'original' not in cols:
+        db.execute("ALTER TABLE submissions ADD COLUMN original TEXT")
+    db.commit()
 
 def backfill_points():
     db = get_db()
@@ -167,36 +162,10 @@ def _to_rgb_no_alpha(img: Image.Image) -> Image.Image:
         return img.convert('RGB')
     return img
 
-
-def _save_image_make_thumb(fs_obj, out_base: Path, exif_bytes: bytes | None = None):
-    # open again from stream start; caller should have seek(0) already
-    img = Image.open(fs_obj.stream)
-    img = ImageOps.exif_transpose(img)
-    img = _to_rgb_no_alpha(img)
-
-    main_name = f"{out_base.stem}.jpg"
-    main_path = UPLOAD_DIR / main_name
-    # preserve EXIF if available
-    if exif_bytes:
-        img.save(main_path, format='JPEG', quality=88, optimize=True, exif=exif_bytes)
-    else:
-        img.save(main_path, format='JPEG', quality=88, optimize=True)
-
-    thumb_name = f"{out_base.stem}_thumb.jpg"
-    thumb_path = UPLOAD_DIR / thumb_name
-    thumb = img.copy()
-    thumb.thumbnail((200, 200))
-    thumb.save(thumb_path, format='JPEG', quality=85, optimize=True)
-
-    return f"/uploads/{main_name}", f"/uploads/{thumb_name}"
-
-
-# EXIF helpers
 _TAGS = {v: k for k, v in ExifTags.TAGS.items()}
 _GPS_TAGS = ExifTags.GPSTAGS
 
 def _rational_to_float(x):
-    # Pillow can return tuple(Fraction) or PIL.TiffImagePlugin.IFDRational
     try:
         return float(x[0]) / float(x[1]) if isinstance(x, tuple) else float(x)
     except Exception:
@@ -218,43 +187,34 @@ def _dms_to_deg(values, ref):
         return None
 
 def _parse_exif(img: Image.Image) -> dict:
-    """
-    Return a normalized dict with common EXIF fields + gps + best-effort IMEI.
-    """
     out = {}
     try:
         exif = img.getexif()
         if not exif:
             return out
-        # map numeric tags to names
         tmp = {}
         for tag_id, value in exif.items():
             name = ExifTags.TAGS.get(tag_id, str(tag_id))
             tmp[name] = value
 
-        # Common fields
         out['make'] = tmp.get('Make')
         out['model'] = tmp.get('Model')
         out['software'] = tmp.get('Software')
         out['datetime_original'] = tmp.get('DateTimeOriginal') or tmp.get('DateTime')
         out['orientation'] = tmp.get('Orientation')
         out['lens_model'] = tmp.get('LensModel') or tmp.get('LensMake')
-
-        # Exposure-ish
         out['f_number'] = tmp.get('FNumber')
         out['exposure_time'] = tmp.get('ExposureTime')
         out['iso_speed'] = tmp.get('ISOSpeedRatings') or tmp.get('PhotographicSensitivity')
         out['focal_length'] = tmp.get('FocalLength')
 
-        # GPS
         gps_raw = tmp.get('GPSInfo')
         if gps_raw:
-            # gps_raw is dict with numeric keys mapped to GPSTAGS
             gps = {}
             for k, v in gps_raw.items():
                 name = _GPS_TAGS.get(k, str(k))
                 gps[name] = v
-            lat = None; lon = None
+            lat = lon = None
             if 'GPSLatitude' in gps and 'GPSLatitudeRef' in gps:
                 lat = _dms_to_deg(gps['GPSLatitude'], gps.get('GPSLatitudeRef'))
             if 'GPSLongitude' in gps and 'GPSLongitudeRef' in gps:
@@ -262,7 +222,7 @@ def _parse_exif(img: Image.Image) -> dict:
             if lat is not None and lon is not None:
                 out['gps'] = {'lat': lat, 'lon': lon}
 
-        # Best-effort IMEI hunt (rare). Look through string fields.
+        # Best-effort IMEI hunt (rare)
         imei = None
         str_fields = []
         for k, v in tmp.items():
@@ -273,16 +233,47 @@ def _parse_exif(img: Image.Image) -> dict:
                 except Exception:
                     pass
         blob = " ".join(str_fields)
-        # IMEI is typically 14-16 digits; use conservative regex, prefer TAC-based 14/15 digits
         m = re.search(r'\b(\d{14,16})\b', blob)
         if m:
             imei = m.group(1)
         out['imei'] = imei
-
     except Exception:
-        # don't fail uploads if EXIF parsing chokes
         pass
     return out
+
+def _save_original_and_thumb(file, sub_id: str) -> tuple[str, str]:
+    """
+    Save the original bytes untouched (keeps all metadata, format, etc.)
+    and generate a JPEG thumbnail for UI display.
+    Returns (original_relpath, thumb_relpath).
+    """
+    # Save original
+    orig_ext = Path(file.filename).suffix.lower() or ""
+    if not orig_ext or len(orig_ext) > 6:
+        orig_ext = ".bin"  # fallback
+    orig_name = f"{sub_id}{orig_ext}"
+    orig_path = UPLOAD_DIR / orig_name
+
+    file.stream.seek(0)
+    with open(orig_path, 'wb') as f:
+        f.write(file.stream.read())
+
+    # Make a JPEG thumbnail
+    file.stream.seek(0)
+    try:
+        img = Image.open(file.stream)
+        img = ImageOps.exif_transpose(img)
+        img = _to_rgb_no_alpha(img)
+        thumb_name = f"{sub_id}_thumb.jpg"
+        thumb_path = UPLOAD_DIR / thumb_name
+        img.thumbnail((200, 200))
+        img.save(thumb_path, format='JPEG', quality=85, optimize=True)
+        thumb_rel = f"/uploads/{thumb_name}"
+    except Exception:
+        # If we can't decode, use a 1x1 placeholder?
+        thumb_rel = f"/uploads/{orig_name}"  # last resort: link to original
+
+    return f"/uploads/{orig_name}", thumb_rel
 
 # -----------------------------------------------------------------------------
 # Pages
@@ -307,7 +298,7 @@ def submit():
     init_db()
     backfill_points()
 
-    # ---- Validate file ----
+    # Validate file
     if 'image' not in request.files:
         return jsonify({'error': 'missing file field "image"'}), 400
     file = request.files['image']
@@ -316,39 +307,29 @@ def submit():
     if not _is_image(file):
         return jsonify({'error': 'unsupported file type'}), 400
 
-    # ---- Form fields ----
+    # Form fields
     uid = (request.form.get('uid') or str(uuid.uuid4())).strip()
     alias = (request.form.get('alias') or 'guest').strip()
     category = (request.form.get('category') or 'general').strip()
     description = (request.form.get('description') or '').strip()
     points = CATEGORY_POINTS.get(category, 0)
 
-    # ---- Extract EXIF from the ORIGINAL upload BEFORE saving ----
-    exif_bytes = None
+    # Extract metadata from the original upload (before saving)
     meta = {}
     try:
         file.stream.seek(0)
         _orig_img = Image.open(file.stream)
-        exif_obj = _orig_img.getexif()
-        exif_bytes = exif_obj.tobytes() if exif_obj else None
         meta = _parse_exif(_orig_img) or {}
     except Exception:
-        exif_bytes = None
         meta = {}
     finally:
-        # We'll re-open inside the saver; reset stream first
         try: file.stream.seek(0)
         except Exception: pass
 
-    # ---- Save images (preserving EXIF when available) ----
+    # Save original + thumbnail
     sub_id = str(uuid.uuid4())
-    image_rel, thumb_rel = _save_image_make_thumb(
-        file,
-        UPLOAD_DIR / sub_id,
-        exif_bytes=exif_bytes  # <- new: keep EXIF on the saved JPEG
-    )
+    original_rel, thumb_rel = _save_original_and_thumb(file, sub_id)
 
-    # ---- Persist ----
     now = datetime.utcnow().isoformat(timespec='seconds') + 'Z'
     day_key = date.today().isoformat()
 
@@ -356,23 +337,26 @@ def submit():
     db.execute(
         """
         INSERT INTO submissions
-          (id, uid, alias, category, points, description, image, thumb, day_key, created_at, metadata)
-        VALUES (?,  ?,   ?,     ?,        ?,      ?,           ?,     ?,     ?,       ?,        ?)
+          (id, uid, alias, category, points, description, image, thumb, day_key, created_at, metadata, original)
+        VALUES (?,  ?,   ?,     ?,        ?,      ?,           ?,     ?,     ?,       ?,        ?,        ?)
         """,
         (
             sub_id, uid, alias, category, points, description,
-            image_rel.lstrip('/'), thumb_rel.lstrip('/'),
-            day_key, now, json.dumps(meta, ensure_ascii=False)
+            original_rel.lstrip('/'),  # 'image' kept for compatibility; store original path
+            thumb_rel.lstrip('/'),
+            day_key, now, json.dumps(meta, ensure_ascii=False),
+            original_rel.lstrip('/'),
         )
     )
     db.commit()
 
-    # ---- Response ----
     return jsonify({
         'id': sub_id, 'uid': uid, 'alias': alias,
         'category': category, 'points': points,
         'description': description,
-        'image': image_rel, 'thumb': thumb_rel,
+        'image': original_rel,        # compatibility (same as original)
+        'original': original_rel,     # explicit original
+        'thumb': thumb_rel,
         'day_key': day_key, 'created': now,
         'metadata': meta,
     }), 201
@@ -415,7 +399,7 @@ def leaderboard():
     up = db.execute(
         """
         SELECT id, uid, COALESCE(alias,'guest') AS alias, category, points, description,
-               image, thumb, created_at, metadata
+               image, thumb, created_at, metadata, original
         FROM submissions
         ORDER BY datetime(created_at) DESC
         """
@@ -427,7 +411,8 @@ def leaderboard():
         'category': r['category'],
         'points': r['points'],
         'description': r['description'] or '',
-        'image': '/' + r['image'].lstrip('/'),
+        'image': '/' + r['image'].lstrip('/'),       # compat
+        'original': '/' + (r['original'] or r['image']).lstrip('/'),
         'thumb': '/' + r['thumb'].lstrip('/'),
         'created': r['created_at'],
         'metadata': json.loads(r['metadata']) if r['metadata'] else {},
@@ -452,10 +437,8 @@ def sw():
 # -----------------------------------------------------------------------------
 @app.route('/api/admin/me', methods=['GET'])
 def admin_me():
-    return jsonify({
-        'is_admin': bool(session.get('is_admin')),
-        'user': ADMIN_USERNAME if session.get('is_admin') else None
-    })
+    return jsonify({'is_admin': bool(session.get('is_admin')),
+                    'user': ADMIN_USERNAME if session.get('is_admin') else None})
 
 @app.route('/api/admin/login', methods=['POST'])
 def admin_login():
@@ -480,7 +463,7 @@ def admin_list():
     rows = db.execute(
         """
         SELECT id, uid, COALESCE(alias,'guest') AS alias, category, points, description,
-               image, thumb, created_at, metadata
+               image, thumb, created_at, metadata, original
         FROM submissions
         ORDER BY datetime(created_at) DESC
         """
@@ -494,7 +477,8 @@ def admin_list():
             'category': r['category'],
             'points': r['points'],
             'description': r['description'] or '',
-            'image': '/' + r['image'].lstrip('/'),
+            'image': '/' + r['image'].lstrip('/'),           # compat
+            'original': '/' + (r['original'] or r['image']).lstrip('/'),
             'thumb': '/' + r['thumb'].lstrip('/'),
             'created': r['created_at'],
             'metadata': json.loads(r['metadata']) if r['metadata'] else {},
@@ -541,7 +525,7 @@ def admin_delete():
 
     db = get_db()
     row = db.execute(
-        "SELECT image, thumb FROM submissions WHERE id=?", (sub_id,)
+        "SELECT image, thumb, original FROM submissions WHERE id=?", (sub_id,)
     ).fetchone()
     if not row:
         return jsonify({'error': 'not found'}), 404
@@ -554,13 +538,15 @@ def admin_delete():
         except Exception:
             pass
 
-    _rm(row['image']); _rm(row['thumb'])
+    _rm(row['image'] or '')
+    _rm(row['thumb'] or '')
+    _rm(row['original'] or '')
     db.execute("DELETE FROM submissions WHERE id=?", (sub_id,))
     db.commit()
     return jsonify({'ok': True})
 
 # -----------------------------------------------------------------------------
-# CLI helper & dev server
+# CLI helper (hash) & dev server
 # -----------------------------------------------------------------------------
 def _cli():
     parser = argparse.ArgumentParser(description="SpotOps app")
