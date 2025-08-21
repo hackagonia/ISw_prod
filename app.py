@@ -196,7 +196,7 @@ def _save_original_and_thumb(file, sub_id: str) -> tuple[str, str]:
     return f"/uploads/{orig_name}", thumb_rel
 
 # -----------------------------------------------------------------------------
-# PyExifTool integration
+# ExifTool integration
 # -----------------------------------------------------------------------------
 def _extract_metadata_with_exiftool(full_path: str) -> dict:
     """
@@ -258,7 +258,7 @@ def submit():
 
     # Extract metadata via PyExifTool (full tag dump)
     meta = _extract_metadata_with_exiftool(full_path)
-
+    
     # Persist
     now = datetime.utcnow().isoformat(timespec='seconds') + 'Z'
     day_key = date.today().isoformat()
